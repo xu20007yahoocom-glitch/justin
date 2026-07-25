@@ -1,6 +1,3 @@
-export default async function handler(req: any, res: any) {
-
-// 复制 server.ts 中的 STOCKS_METADATA 与 fetchStockFromYahoo 函数逻辑
 const STOCKS_METADATA: Record<string, { companyName: string; fallbackPrice: number }> = {
   UGI: { companyName: "UGI Corporation", fallbackPrice: 24.50 },
   LNG: { companyName: "Cheniere Energy, Inc.", fallbackPrice: 178.20 },
@@ -17,15 +14,15 @@ async function fetchStockFromYahoo(symbol: string, range: string = "1mo") {
     if (!response.ok) throw new Error("Yahoo error");
     const data: any = await response.json();
     const result = data?.chart?.result?.[0];
-    const price = result.meta.regularMarketPrice || STOCKS_METADATA[symbol].fallbackPrice;
-    return { symbol, companyName: STOCKS_METADATA[symbol].companyName, price };
+    const price = result?.meta?.regularMarketPrice || STOCKS_METADATA[symbol]?.fallbackPrice || 100;
+    return { symbol, companyName: STOCKS_METADATA[symbol]?.companyName || symbol, price };
   } catch (err) {
-    return { symbol, companyName: STOCKS_METADATA[symbol].companyName, price: STOCKS_METADATA[symbol].fallbackPrice };
+    return { symbol, companyName: STOCKS_METADATA[symbol]?.companyName || symbol, price: STOCKS_METADATA[symbol]?.fallbackPrice || 100 };
   }
 }
 
-export default async function handler(req: VercelRequest, res: VercelResponse) {
-  const range = (req.query.range as string) || "1m";
+export default async function handler(req: any, res: any) {
+  const range = (req.query?.range as string) || "1m";
   try {
     const promises = Object.keys(STOCKS_METADATA).map(symbol => fetchStockFromYahoo(symbol, range));
     const results = await Promise.all(promises);
