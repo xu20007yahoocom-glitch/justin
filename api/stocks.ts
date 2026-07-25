@@ -1,4 +1,4 @@
-import type { VercelRequest, VercelResponse } from '@vercel/node';
+export default async function handler(req: any, res: any) {
 
 // 复制 server.ts 中的 STOCKS_METADATA 与 fetchStockFromYahoo 函数逻辑
 const STOCKS_METADATA: Record<string, { companyName: string; fallbackPrice: number }> = {
