@@ -1,12 +1,14 @@
-export default async function handler(req: any, res: any) {
 import { GoogleGenAI } from "@google/genai";
 
 const apiKey = process.env.GEMINI_API_KEY;
 let ai = apiKey ? new GoogleGenAI({ apiKey }) : null;
 
-export default async function handler(req: VercelRequest, res: VercelResponse) {
+export default async function handler(req: any, res: any) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
-  const { symbol } = req.body || {};
+  
+  // 确保能解析 JSON body
+  const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
+  const symbol = body?.symbol || "UGI";
 
   if (!ai) {
     return res.status(200).json({ summary: "运行于模拟模式（未配置 GEMINI_API_KEY）" });
