@@ -1,6 +1,6 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
-import { fetchAllStocks } from "../../lib/stocksData";
-import { sendWhatsAppMessage } from "../../lib/notifications";
+import { fetchAllStocks } from "../../lib/stocksData.js";
+import { sendWhatsAppMessage } from "../../lib/notifications.js";
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== "POST") {

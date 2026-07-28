@@ -3,7 +3,7 @@
  * under /api. Kept separate from server.ts (used by the Cloud Run / AI Studio
  * build) so both entry points can eventually share the same source of truth.
  */
-import { StockQuote, HistoricalDataPoint } from "../src/types";
+import type { StockQuote, HistoricalDataPoint } from "../src/types.js";
 
 export const STOCKS_METADATA: Record<string, { companyName: string; fallbackPrice: number }> = {
   UGI: { companyName: "UGI Corporation", fallbackPrice: 24.50 },
