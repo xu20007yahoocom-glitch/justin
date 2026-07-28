@@ -22,7 +22,8 @@ export const PortfolioCalculator: React.FC<PortfolioCalculatorProps> = ({ stocks
     return [
       { symbol: "UGI", shares: 100, avgCost: 24.10 },
       { symbol: "LNG", shares: 15, avgCost: 175.50 },
-      { symbol: "DXCM", shares: 25, avgCost: 85.00 }
+      { symbol: "DXCM", shares: 25, avgCost: 85.00 },
+      { symbol: "PTEN", shares: 200, avgCost: 10.50 }
     ];
   });
 
@@ -315,7 +316,7 @@ export const PortfolioCalculator: React.FC<PortfolioCalculatorProps> = ({ stocks
             我的投资持仓组合
           </h2>
           <p className="text-xs text-slate-400 mt-0.5">
-            实时模拟与分析您的 UGI、LNG、DXCM 和 PTEN 股票持仓与模拟买卖表现。
+            实时模拟与分析您的 {stocks.length > 0 ? stocks.map(s => s.symbol).join("、") : "UGI、LNG、DXCM、PTEN"} 股票持仓与模拟买卖表现。
           </p>
         </div>
 
@@ -360,7 +361,7 @@ export const PortfolioCalculator: React.FC<PortfolioCalculatorProps> = ({ stocks
           </div>
           <div className="flex justify-between text-xs font-medium text-slate-500">
             <span>配置股票品种数</span>
-            <span className="font-mono text-slate-700">{portfolio.length} / 3</span>
+            <span className="font-mono text-slate-700">{portfolio.length} / {stocks.length || 4}</span>
           </div>
         </div>
       </div>

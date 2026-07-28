@@ -1,33 +1,13 @@
-const STOCKS_METADATA: Record<string, { companyName: string; fallbackPrice: number }> = {
-  UGI: { companyName: "UGI Corporation", fallbackPrice: 24.50 },
-  LNG: { companyName: "Cheniere Energy, Inc.", fallbackPrice: 178.20 },
-  DXCM: { companyName: "Dexcom, Inc.", fallbackPrice: 88.40 },
-  PTEN: { companyName: "Patterson-UTI Energy, Inc.", fallbackPrice: 10.25 }
-};
+import type { VercelRequest, VercelResponse } from "@vercel/node";
+import { fetchAllStocks } from "../lib/stocksData";
 
-async function fetchStockFromYahoo(symbol: string, range: string = "1mo") {
-  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?range=${range}&interval=1d`;
-  try {
-    const response = await fetch(url, {
-      headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/json" }
-    });
-    if (!response.ok) throw new Error("Yahoo error");
-    const data: any = await response.json();
-    const result = data?.chart?.result?.[0];
-    const price = result?.meta?.regularMarketPrice || STOCKS_METADATA[symbol]?.fallbackPrice || 100;
-    return { symbol, companyName: STOCKS_METADATA[symbol]?.companyName || symbol, price };
-  } catch (err) {
-    return { symbol, companyName: STOCKS_METADATA[symbol]?.companyName || symbol, price: STOCKS_METADATA[symbol]?.fallbackPrice || 100 };
-  }
-}
-
-export default async function handler(req: any, res: any) {
+export default async function handler(req: VercelRequest, res: VercelResponse) {
   const range = (req.query?.range as string) || "1m";
   try {
-    const promises = Object.keys(STOCKS_METADATA).map(symbol => fetchStockFromYahoo(symbol, range));
-    const results = await Promise.all(promises);
+    const results = await fetchAllStocks(range);
+    res.setHeader("Cache-Control", "s-maxage=15, stale-while-revalidate=30");
     return res.status(200).json(results);
   } catch (error: any) {
-    return res.status(500).json({ error: error.message });
+    return res.status(500).json({ error: error.message || "Failed to fetch stock data" });
   }
 }

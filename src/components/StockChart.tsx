@@ -29,6 +29,13 @@ export const StockChart: React.FC<StockChartProps> = ({
     { label: "1Y", value: "1y" }
   ];
 
+  const COMPARE_COLORS: Record<string, string> = {
+    UGI: "#3b82f6",
+    LNG: "#10b981",
+    DXCM: "#f59e0b",
+    PTEN: "#8b5cf6"
+  };
+
   // Helper to build normalized comparison data
   // We align all stocks by their date indexes and normalize prices to % change from the start of the timeframe.
   const buildComparisonData = () => {
@@ -179,30 +186,17 @@ export const StockChart: React.FC<StockChartProps> = ({
               />
               <Tooltip content={<CustomCompareTooltip />} />
               <Legend iconType="circle" wrapperStyle={{ fontSize: "11px", paddingTop: "10px" }} />
-              <Line
-                type="monotone"
-                dataKey="UGI"
-                stroke="#3b82f6"
-                strokeWidth={2}
-                dot={false}
-                activeDot={{ r: 4 }}
-              />
-              <Line
-                type="monotone"
-                dataKey="LNG"
-                stroke="#10b981"
-                strokeWidth={2}
-                dot={false}
-                activeDot={{ r: 4 }}
-              />
-              <Line
-                type="monotone"
-                dataKey="DXCM"
-                stroke="#f59e0b"
-                strokeWidth={2}
-                dot={false}
-                activeDot={{ r: 4 }}
-              />
+              {stocks.map(stock => (
+                <Line
+                  key={stock.symbol}
+                  type="monotone"
+                  dataKey={stock.symbol}
+                  stroke={COMPARE_COLORS[stock.symbol] || "#64748b"}
+                  strokeWidth={2}
+                  dot={false}
+                  activeDot={{ r: 4 }}
+                />
+              ))}
             </LineChart>
           ) : (
             <AreaChart data={activeStock.history} margin={{ top: 5, right: 5, left: -15, bottom: 5 }}>
