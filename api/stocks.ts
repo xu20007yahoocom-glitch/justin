@@ -1,5 +1,5 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
-import { fetchAllStocks } from "../lib/stocksData";
+import { fetchAllStocks } from "../lib/stocksData.js";
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   const range = (req.query?.range as string) || "1m";

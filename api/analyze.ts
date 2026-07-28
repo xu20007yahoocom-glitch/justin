@@ -1,7 +1,7 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { GoogleGenAI } from "@google/genai";
-import { STOCKS_METADATA } from "../lib/stocksData";
-import { getSimulatedAnalysis } from "../lib/simulatedAnalysis";
+import { STOCKS_METADATA } from "../lib/stocksData.js";
+import { getSimulatedAnalysis } from "../lib/simulatedAnalysis.js";
 
 const apiKey = process.env.GEMINI_API_KEY;
 const ai = apiKey ? new GoogleGenAI({ apiKey }) : null;

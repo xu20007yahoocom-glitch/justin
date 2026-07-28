@@ -1,5 +1,5 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
-import { getSettings, saveSettings, WhatsAppSettings } from "../../lib/notifications";
+import { getSettings, saveSettings, WhatsAppSettings } from "../../lib/notifications.js";
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== "POST") {
