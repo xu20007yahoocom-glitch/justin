@@ -179,8 +179,8 @@ export default function App() {
 
         {/* Ticker Cards */}
         {isLoading && stocks.length === 0 ? (
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-            {[1, 2, 3].map(i => (
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+            {[1, 2, 3, 4].map(i => (
               <div key={i} className="bg-white border border-slate-100 p-6 rounded-2xl h-44 animate-pulse space-y-4">
                 <div className="h-4 bg-slate-200 rounded w-1/4" />
                 <div className="h-8 bg-slate-200 rounded w-1/2" />
@@ -189,7 +189,7 @@ export default function App() {
             ))}
           </div>
         ) : (
-          <section id="stock-tickers" className="grid grid-cols-1 md:grid-cols-3 gap-6">
+          <section id="stock-tickers" className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
             {stocks.map(stock => (
               <StockCard
                 key={stock.symbol}
