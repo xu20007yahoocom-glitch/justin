@@ -37,6 +37,33 @@ const LOGS_FILE = path.join("/tmp", "whatsapp_logs.json");
 const MAX_LOGS = 25;
 export const FIFTEEN_MINUTES_MS = 15 * 60 * 1000;
 
+/**
+ * Resolve the public dashboard URL used in the "🔗 Live Dashboard:" footer
+ * of outgoing Telegram alerts. Centralized here so every caller (scheduled
+ * cron alert, manual test alert, etc.) is guaranteed to produce an
+ * identical, always-populated link instead of each duplicating
+ * `process.env.APP_URL || ""` independently (which silently produced an
+ * empty link whenever APP_URL wasn't set for that particular deployment).
+ *
+ * Resolution order:
+ *   1. APP_URL    — explicit override, works on both Vercel and Cloud Run.
+ *                   Set this to your canonical public domain (e.g. Cloud
+ *                   Run's https://ais-dev-xxx.run.app, or your Vercel
+ *                   production domain).
+ *   2. VERCEL_URL — auto-injected by Vercel on every deployment (preview +
+ *                   production) as a bare host, e.g. "my-app.vercel.app"
+ *                   (no protocol). Used as a same-deployment fallback so
+ *                   the link is never blank even if APP_URL was never
+ *                   configured on Vercel.
+ *   3. ""         — last resort if neither is available (e.g. local dev
+ *                   without .env set).
+ */
+export function getDashboardUrl(): string {
+  if (process.env.APP_URL) return process.env.APP_URL;
+  if (process.env.VERCEL_URL) return `https://${process.env.VERCEL_URL}`;
+  return "";
+}
+
 export function getSettings(): WhatsAppSettings {
   try {
     if (fs.existsSync(CONFIG_FILE)) {
