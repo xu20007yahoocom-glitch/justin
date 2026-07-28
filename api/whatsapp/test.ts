@@ -1,6 +1,6 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { fetchAllStocks } from "../../lib/stocksData.js";
-import { sendWhatsAppMessage } from "../../lib/notifications.js";
+import { sendWhatsAppMessage, getDashboardUrl } from "../../lib/notifications.js";
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== "POST") {
@@ -20,7 +20,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       messageBody += `*${q.symbol}*: $${q.price.toFixed(2)} (${arrow} ${sign}${q.changePercent.toFixed(2)}%)\n`;
     });
 
-    messageBody += `\n🔗 Live Dashboard:\n${process.env.APP_URL || ""}`;
+    messageBody += `\n🔗 Live Dashboard:\n${getDashboardUrl()}`;
 
     const result = await sendWhatsAppMessage(messageBody);
     return res.status(200).json(result);

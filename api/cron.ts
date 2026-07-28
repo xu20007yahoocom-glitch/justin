@@ -1,6 +1,6 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { fetchAllStocks } from "../lib/stocksData.js";
-import { sendWhatsAppMessage } from "../lib/notifications.js";
+import { sendWhatsAppMessage, getDashboardUrl } from "../lib/notifications.js";
 
 /**
  * Scheduled stock scrape + Telegram broadcast, triggered by Vercel Cron
@@ -35,7 +35,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       messageBody += `Range: $${q.low.toFixed(1)} - $${q.high.toFixed(1)}\n\n`;
     });
 
-    messageBody += `🔗 Live Dashboard:\n${process.env.APP_URL || ""}`;
+    messageBody += `🔗 Live Dashboard:\n${getDashboardUrl()}`;
 
     const result = await sendWhatsAppMessage(messageBody);
     return res.status(200).json({ success: true, timestamp: new Date().toISOString(), notification: result });
