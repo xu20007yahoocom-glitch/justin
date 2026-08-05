@@ -1,3 +1,6 @@
+---
+*** Begin Patch
+*** Update File: lib/simulatedAnalysis.ts
 @@
 -  const movingAverageNote =
 -    technicals.smaShort !== null && technicals.smaLong !== null
@@ -9,4 +12,4 @@
 +          technicals.trend
 +        )}。`
 +      : "歷史資料點不足，暫無法計算穩定的均線關係。";
-@@
+*** End Patch
