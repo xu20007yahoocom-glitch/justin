@@ -75,19 +75,19 @@ function buildPrompt(context: AnalysisContext, dataLimitations: string[]): strin
 
   return `你是一位專業的股票分析師。請針對股票 ${context.quote.symbol}（${context.quote.companyName}）撰寫一份結構化的投資分析報告。
 
-## 你可以使用的「真實數據」（以下數字皆為系統實際計算/取得的真實數據，你必須完全依據這些數字進行技術面與估值判斷，不可自行更改或重新計算）：
+## 你可以使用的「真實數據」（以下數字皆為系統實際計算/取得的真實數據，你必須完全依據這些數字進行技術面與估值判斷，不可自行更改或重新[...]
 ${technicalFacts}
 
 ## 已知的資料限制（你必須在分析中誠實反映這些限制，不可假裝擁有這些資料）：
 ${dataLimitations.map((l) => `- ${l}`).join("\n")}
 
 ## 硬性規則（違反視為分析失敗）：
-1. 任何具體數值型的技術指標（均線、動能、支撐/壓力、波動率）**只能使用上方「真實數據」提供的數字**，禁止自行編造或臆測其他數值型技術指標（例如：不可自行生成 MACD、RSI、KDJ 的具體數字，因為系統並未計算這些指標）。
-2. 基本面數據（EPS、營收、毛利率、ROE、本益比、股利率等精確數值）**你沒有可靠的即時財報數據來源**。如果你不確定，必須明確使用「估計」「約」等字眼，或直接說明「資料不足，無法提供精確數字」，絕對不可捏造看起來精確但實際不存在依據的數字。
-3. 「valuation」（估值判斷）只能依據上方「目前價格於支撐-壓力區間位置」等真實數據，以及你對該公司的一般性產業認知做「相對評價」（偏貴/合理/偏便宜），不可捏造 PE/PB 等具體比率數字。若資料不足以判斷，請將 assessment 設為 "INSUFFICIENT_DATA"。
-4. 你可以使用你的知識與（若可用）即時搜尋能力，補充該公司近期新聞、產業地位、催化劑等「質化」資訊，但這些內容必須清楚是敘述性描述，不可包裝成精確財務數字。
+1. 任何具體數值型的技術指標（均線、動能、支撐/壓力、波動率）**只能使用上方「真實數據」提供的數字**，禁止自行編造或臆測其他數值型技術��[...]
+2. 基本面數據（EPS、營收、毛利率、ROE、本益比、股利率等精確數值）**你沒有可靠的即時財報數據來源**。如果你不確定，必須明確使用「估計」「[...]
+3. 「valuation」（估值判斷）只能依據上方「目前價格於支撐-壓力區間位置」等真實數據，以及你對該公司的一般性產業認知做「相對評價」（偏貴/��[...]
+4. 你可以使用你的知識與（若可用）即時搜尋能力，補充該公司近期新聞、產業地位、催化劑等「質化」資訊，但這些內容必須清楚是敘述性描述，�[...]
 5. 所有文字輸出請使用「${language}」撰寫。
-6. 「confidenceLevel」欄位請你依據資料完整度誠實給出 "high" | "medium" | "low"（系統會在你的回答之後再做一次強制校正，若資料不足你給了 "high" 系統會自動下修，因此請盡量誠實評估而非樂觀高估）。
+6. 「confidenceLevel」欄位請你依據資料完整度誠實給出 "high" | "medium" | "low"（系統會在你的回答之後再做一次強制校正，若資料不足你給了 "high" 系統會[...]
 7. 「dataLimitations」欄位請直接原樣輸出上方列出的「已知的資料限制」清單（可用你的語言重新表述，但語意必須一致，不可省略）。
 
 ## 請以下列 JSON 結構輸出（欄位名稱與型別必須完全符合，不可增減欄位名稱）：
@@ -275,23 +275,53 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         tools: [{ googleSearch: {} }],
         responseMimeType: "application/json",
         systemInstruction:
-          "You are an expert Wall Street financial analyst. You produce structured, professional stock analysis strictly grounded in the real numeric data supplied to you. You never fabricate precise financial figures (EPS, revenue, PE ratio, ROE, etc.) you were not given — when uncertain, you say so explicitly or use qualifying words like 'estimate'/'approximately'. You write in the language specified by the user."
+          "You are an expert Wall Street financial analyst. You produce structured, professional stock analysis strictly grounded in the real numeric data supplied to you. You never fabricate pre[...]"
       }
     });
 
-    const responseText = response.text || "{}";
-    const parsedData = JSON.parse(responseText.trim());
+    // Robust: log raw response and try multiple extraction paths before parsing JSON
+    console.log("Gemini raw response:", JSON.stringify(response, null, 2));
+    let responseText = "{}";
+    try {
+      if (typeof (response as any)?.text === "string" && (response as any).text.trim()) {
+        responseText = (response as any).text;
+      } else if (typeof (response as any)?.outputText === "string" && (response as any).outputText.trim()) {
+        responseText = (response as any).outputText;
+      } else if (Array.isArray((response as any)?.candidates) && (response as any).candidates[0]?.content) {
+        const c = (response as any).candidates[0].content;
+        if (typeof c === "string") {
+          responseText = c;
+        } else if (Array.isArray(c)) {
+          responseText = c.map((p: any) => (p?.text ? p.text : "")).join("");
+        } else {
+          responseText = JSON.stringify(c);
+        }
+      } else {
+        responseText = JSON.stringify(response);
+      }
 
-    const groundingChunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
-    const sources = groundingChunks
-      .filter((chunk: any) => chunk.web?.uri)
-      .map((chunk: any) => ({
-        title: chunk.web.title || "Web Source",
-        uri: chunk.web.uri
-      }));
+      let parsedData: any;
+      try {
+        parsedData = JSON.parse(responseText.trim());
+      } catch (parseErr) {
+        console.error("Failed to JSON.parse Gemini responseText:", responseText);
+        throw parseErr;
+      }
 
-    const result = shapeAnalysisResult(parsedData, context, dataLimitations, sources);
-    return res.status(200).json(result);
+      const groundingChunks = (response as any).candidates?.[0]?.groundingMetadata?.groundingChunks || [];
+      const sources = groundingChunks
+        .filter((chunk: any) => chunk.web?.uri)
+        .map((chunk: any) => ({
+          title: chunk.web.title || "Web Source",
+          uri: chunk.web.uri
+        }));
+
+      const result = shapeAnalysisResult(parsedData, context, dataLimitations, sources);
+      return res.status(200).json(result);
+    } catch (err) {
+      console.error("Gemini parse/extract error:", err);
+      throw err; // outer catch will handle fallback
+    }
   } catch (error: any) {
     console.error("Gemini API Error, falling back to offline analysis:", error);
     const fallback = await getSimulatedAnalysis(symbol, companyName);
