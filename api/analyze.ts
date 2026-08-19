@@ -265,7 +265,8 @@ function modelSupportsGenerateContent(model: GeminiModelInfo): boolean {
 }
 
 function modelNameFromResource(resourceName: string | undefined): string {
-  return typeof resourceName === "string" ? resourceName.replace(/^models\//, "").trim() : "";
+  const normalized = typeof resourceName === "string" ? resourceName.trim() : "";
+  return normalized.startsWith("models/") ? normalized.slice("models/".length) : normalized;
 }
 
 async function discoverCompatibleGeminiModels(apiKey: string, signal: AbortSignal): Promise<string[]> {
