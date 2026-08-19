@@ -1,114 +1,203 @@
+import { buildAnalysisContext } from "./analysisData.js";
 import { fetchStockFromYahoo } from "./stocksData.js";
-import { computeTechnicalIndicators } from "./technicalIndicators.js";
-import type { AnalysisResult } from "../src/types.js";
+import { buildDataLimitations, computeTechnicalIndicators } from "./technicalIndicators.js";
+import type {
+  AnalysisContext,
+  AnalysisResult,
+  CompanyBackground,
+  FinancialMetricSet,
+  MarketScope,
+  SourcedField
+} from "../src/types.js";
 
-export async function getSimulatedAnalysis(symbol: string, companyName?: string): Promise<AnalysisResult> {
-  // Defensive: ensure we always return the full AnalysisResult shape.
-  companyName = companyName ?? symbol;
+const AI_CONFIDENCE = "AI 綜合判斷，非即時財報數據" as const;
 
+function fallbackField(value: string | null, reason = "尚無可用資料"): SourcedField<string> {
+  return {
+    value,
+    dataConfidence: AI_CONFIDENCE,
+    source: "模擬分析 fallback",
+    endpoint: null,
+    sourceField: null,
+    fetchedAt: null,
+    periodEnd: null,
+    isStale: false,
+    unavailableReason: value === null ? "尚無可用資料" : null
+  };
+}
+
+function unavailableNumber(reason = "尚無可用資料"): SourcedField<number> {
+  return {
+    value: null,
+    dataConfidence: AI_CONFIDENCE,
+    source: "Unavailable",
+    endpoint: null,
+    sourceField: null,
+    fetchedAt: null,
+    periodEnd: null,
+    isStale: false,
+    unavailableReason: reason as SourcedField<number>["unavailableReason"]
+  };
+}
+
+function bareCompanyBackground(companyName: string): CompanyBackground {
+  return {
+    companyName: fallbackField(companyName),
+    industry: fallbackField(null),
+    marketCapitalization: unavailableNumber(),
+    marketCapitalizationCurrency: fallbackField(null),
+    exchange: fallbackField(null),
+    ipoDate: fallbackField(null),
+    logoUrl: fallbackField(null),
+    country: fallbackField(null),
+    positioning: fallbackField("系統處於安全 fallback，未取得可驗證的公司定位資料。")
+  };
+}
+
+function bareMetrics(): FinancialMetricSet {
+  return {
+    pe: unavailableNumber(),
+    pb: unavailableNumber(),
+    eps: unavailableNumber(),
+    roe: unavailableNumber(),
+    grossMargin: unavailableNumber(),
+    week52High: unavailableNumber(),
+    week52Low: unavailableNumber(),
+    revenue: unavailableNumber(),
+    netIncome: unavailableNumber()
+  };
+}
+
+function minimalResult(symbol: string, companyName: string): AnalysisResult {
+  const background = bareCompanyBackground(companyName);
+  return {
+    schemaVersion: "1.0",
+    symbol,
+    finnhubSymbol: null,
+    marketScope: symbol.toUpperCase().endsWith(".HK")
+      ? "HK"
+      : symbol.toUpperCase().endsWith(".SH") || symbol.toUpperCase().endsWith(".SZ")
+        ? "CN"
+        : "OTHER",
+    generatedAt: new Date().toISOString(),
+    companyName,
+    lastAnalyzed: new Date().toISOString(),
+    companyBackground: background,
+    oneLineSummary: fallbackField("資料取得失敗，暫無法形成可驗證的投資摘要。"),
+    catalysts: [],
+    topRevenueBusinesses: [],
+    competitors: [],
+    competitiveAdvantage: {
+      summary: fallbackField(null),
+      limitations: fallbackField("缺乏可驗證資料，競爭優勢需查證。")
+    },
+    financialMetrics: bareMetrics(),
+    recommendation: "NEUTRAL",
+    recommendationReason: "資料不足，僅回傳安全 fallback。",
+    confidenceLevel: "low",
+    dataLimitations: ["無法取得或處理即時行情與基本面資料；所有財務數值均標為需查證。"],
+    technicalSummary: {
+      trend: "SIDEWAYS",
+      movingAverageNote: "無法計算。",
+      momentumNote: "無法計算。",
+      volumePriceNote: "無法計算。",
+      supportLevel: null,
+      resistanceLevel: null,
+      summary: "技術資料不可用。"
+    },
+    valuation: {
+      assessment: "INSUFFICIENT_DATA",
+      reasoning: "缺乏可驗證的基本面與技術面資料。"
+    },
+    risks: ["資料可用性風險。"],
+    summary: "安全 fallback 已啟用。",
+    outlook: "需取得可驗證資料後重新分析。",
+    recentNews: [],
+    sources: []
+  };
+}
+
+/**
+ * Returns the identical AnalysisResult shape used by the Gemini path. It preserves every API
+ * measurement already assembled in context, and only adds explicitly-labelled qualitative fallback text.
+ */
+export async function getSimulatedAnalysis(
+  symbol: string,
+  companyName?: string,
+  suppliedContext?: AnalysisContext
+): Promise<AnalysisResult> {
   try {
-    const quote = await fetchStockFromYahoo(symbol);
-    const technicals = computeTechnicalIndicators(quote);
+    let context = suppliedContext;
+    if (!context) {
+      const quote = await fetchStockFromYahoo(symbol);
+      context = await buildAnalysisContext(quote, "zh-TW");
+      context.technicals = computeTechnicalIndicators(quote);
+    }
 
-    const dataLimitations: string[] = [];
-    // If fundamentals/ratings are not available, note that in limitations
-    dataLimitations.push("缺少即時財報 / 估值資料（例如 EPS、營收明細、分析師目標價等）");
-    dataLimitations.push("若需要更完整估值請接入外部基本面資料來源（如 Finnhub / Longbridge 等）");
+    const technicals = context.technicals;
+    const dataLimitations = buildDataLimitations(context);
+    dataLimitations.push("Gemini 未配置或呼叫失敗；定性欄位使用安全 fallback，非即時財報數據。");
 
-    const technicalSummary = {
-      trend: technicals.trend,
-      movingAverageNote:
-        technicals.smaShort !== null && technicals.smaLong !== null
-          ? `短期均線(${technicals.smaShortPeriod}期) 約 ${technicals.smaShort}，長期均線(${technicals.smaLongPeriod}期) 約 ${technicals.smaLong}，當前排列顯示 ${technicals.trend}`
-          : "歷史資料點不足，暫無法計算穩定的均線關係。",
-      momentumNote:
-        technicals.momentumPercent !== null
-          ? `短期動能 (ROC) 約 ${technicals.momentumPercent}%，顯示當前價格相較於數日前的變化趨勢。`
-          : "歷史資料不足，無法計算動能。",
-      volumePriceNote: technicals.volumeNote || "成交量資料不足或不可用。",
-      supportLevel: technicals.supportLevel,
-      resistanceLevel: technicals.resistanceLevel,
-      summary:
-        `依據歷史價格與技術指標，趨勢為 ${technicals.trend}，價格位於支撐-壓力區間的 ${
-          technicals.pricePositionInRange !== null ? (technicals.pricePositionInRange * 100).toFixed(1) + "%" : "N/A"
-        }。`
-    };
+    const trendText = technicals.trend === "UP" ? "上行" : technicals.trend === "DOWN" ? "下行" : "盤整";
+    const apiRevenueBusinesses = context.revenueBusinesses.map((business) => ({
+      ...business,
+      description: business.description.value
+        ? business.description
+        : fallbackField("此項目名稱與占比（如有）來自 Finnhub；未取得可驗證的業務文字說明。")
+    }));
 
-    const result: AnalysisResult = {
-      symbol: quote.symbol,
-      companyName: quote.companyName ?? companyName,
+    return {
+      schemaVersion: "1.0",
+      symbol: context.quote.symbol,
+      finnhubSymbol: context.finnhubSymbol,
+      marketScope: context.marketScope,
+      generatedAt: new Date().toISOString(),
+      companyName: context.companyBackgroundBase.companyName.value ?? companyName ?? context.quote.companyName,
       lastAnalyzed: new Date().toISOString(),
-
+      companyBackground: {
+        ...context.companyBackgroundBase,
+        positioning: fallbackField("未使用 AI 即時推理；公司定位僅以目前可用 API 公司背景為準。")
+      },
+      oneLineSummary: fallbackField(`技術面目前呈現${trendText}，但未完成 AI 推理，基本面缺口請以欄位來源標記為準。`),
+      catalysts: [],
+      topRevenueBusinesses: apiRevenueBusinesses,
+      competitors: [],
+      competitiveAdvantage: {
+        summary: fallbackField(null),
+        limitations: fallbackField("未完成 AI 研究；競爭優勢與同業比較均需查證。")
+      },
+      financialMetrics: context.financialMetrics,
       recommendation: "NEUTRAL",
-      recommendationReason: "資料有限，建議以技術指標作為短期參考，若需長期投資評估請補充基本面資料。",
-      confidenceLevel: "low",
+      recommendationReason: "Gemini 不可用或未設定，系統不將技術資料延伸為個人化買賣建議。",
+      confidenceLevel: technicals.dataSufficiency === "high" && context.fundamentals ? "medium" : "low",
       dataLimitations,
-
-      technicalSummary,
-
-      valuation: {
-        assessment: "INSUFFICIENT_DATA",
-        reasoning: "缺乏即時完整的基本面數據以進行準確估值判斷（EPS、營收、目標價等）。"
-      },
-
-      catalysts: [],
-      risks: [],
-
-      summary: technicalSummary.summary,
-      outlook: "在資料有限情況下，以技術面短期觀察為主；若取得基本面資料，建議重新評估。",
-      oneSentenceSummary: `技術面觀察偏向 ${technicals.trend}，但基本面資料不足以得出確定性結論。`,
-      companyBackground: quote.companyName ?? "",
-      top3RevenueSegment: [],
-      competitors: [],
-      advantages: [],
-
-      recentNews: [],
-      sources: []
-    };
-
-    return result;
-  } catch (err) {
-    // In case of any runtime error, return a minimal but valid AnalysisResult
-    const fallback: AnalysisResult = {
-      symbol: symbol,
-      companyName: companyName ?? symbol,
-      lastAnalyzed: new Date().toISOString(),
-
-      recommendation: "NEUTRAL",
-      recommendationReason: "本地模擬分析因內部錯誤未能完成，請稍後重試。",
-      confidenceLevel: "low",
-      dataLimitations: ["模擬分析執行錯誤：無法取得或處理歷史價格資料。"],
-
       technicalSummary: {
-        trend: "SIDEWAYS",
-        movingAverageNote: "無法計算（模擬分析錯誤）",
-        momentumNote: "無法計算（模擬分析錯誤）",
-        volumePriceNote: "無法計算（模擬分析錯誤）",
-        supportLevel: null,
-        resistanceLevel: null,
-        summary: "模擬分析失敗。"
+        trend: technicals.trend,
+        movingAverageNote:
+          technicals.smaShort !== null && technicals.smaLong !== null
+            ? `短期與長期均線由 Yahoo 歷史價格計算，訊號為${trendText}。`
+            : "歷史資料不足，無法計算穩定的均線關係。",
+        momentumNote:
+          technicals.momentumPercent !== null
+            ? "動能已依 Yahoo 價格序列計算；請參考技術指標欄位。"
+            : "歷史資料不足，無法計算動能。",
+        volumePriceNote: technicals.volumeNote,
+        supportLevel: technicals.supportLevel,
+        resistanceLevel: technicals.resistanceLevel,
+        summary: `此 fallback 僅保留實測行情與可用基本面資料；趨勢為${trendText}。`
       },
-
       valuation: {
-        assessment: "INSUFFICIENT_DATA",
-        reasoning: "模擬分析失敗，無法提供估值判斷。"
+        assessment: context.fundamentals ? "INSUFFICIENT_DATA" : "INSUFFICIENT_DATA",
+        reasoning: "未完成 Gemini 分析；不可根據不完整資料產生精確估值結論。"
       },
-
-      catalysts: [],
-      risks: [],
-
-      summary: "模擬分析錯誤，請稍後再試或檢查伺服器日誌。",
-      outlook: "N/A",
-      oneSentenceSummary: "模擬分析未完成。",
-      companyBackground: "",
-      top3RevenueSegment: [],
-      competitors: [],
-      advantages: [],
-
+      risks: ["AI 分析服務目前不可用。", "未標示為 API 實測的研究性欄位均需查證。"],
+      summary: "系統已啟用安全 fallback；所有可用數值均保留原始 API 來源。",
+      outlook: "待 Gemini 服務恢復後，可在不覆寫現有 API 事實的前提下補充定性研究。",
       recentNews: [],
       sources: []
     };
-
-    return fallback;
+  } catch (error) {
+    console.error("Simulated analysis failed:", error);
+    return minimalResult(symbol, companyName ?? symbol);
   }
 }
