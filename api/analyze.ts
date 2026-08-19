@@ -19,6 +19,57 @@ import type {
 const GEMINI_MODEL = process.env.GEMINI_MODEL?.trim() || "gemini-flash-latest";
 const GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta";
 const GEMINI_TIMEOUT_MS = 15_000;
+const GEMINI_TRANSIENT_MAX_RETRIES = 2;
+const GEMINI_TRANSIENT_BASE_DELAY_MS = 1_000;
+const GEMINI_TRANSIENT_MAX_DELAY_MS = 2_000;
+
+function isTransientGeminiError(error: unknown): error is GeminiHttpError {
+  if (!(error instanceof GeminiHttpError)) return false;
+  return error.status === 503 || error.responsePreview.toUpperCase().includes("UNAVAILABLE");
+}
+
+function waitForRetry(delayMs: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new Error("Gemini retry aborted"));
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, delayMs);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+async function callGeminiWithTransientRetries(
+  model: string,
+  prompt: string,
+  systemInstruction: string,
+  apiKey: string,
+  signal: AbortSignal
+): Promise<GeminiAnalysisDraft> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await callGemini(model, prompt, systemInstruction, apiKey, signal);
+    } catch (error) {
+      if (!isTransientGeminiError(error) || attempt >= GEMINI_TRANSIENT_MAX_RETRIES) throw error;
+      const delayMs = Math.min(
+        GEMINI_TRANSIENT_BASE_DELAY_MS * 2 ** attempt,
+        GEMINI_TRANSIENT_MAX_DELAY_MS
+      );
+      console.warn("Gemini temporarily unavailable; retrying", {
+        attempt: attempt + 1,
+        maxRetries: GEMINI_TRANSIENT_MAX_RETRIES,
+        delayMs,
+        model
+      });
+      await waitForRetry(delayMs, signal);
+    }
+  }
+}
+
+
 const AI_CONFIDENCE = "AI 綜合判斷，非即時財報數據" as const;
 
 interface GeminiCandidate {
@@ -300,13 +351,13 @@ async function requestGemini(prompt: string, systemInstruction: string): Promise
   const timeout = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
   try {
     try {
-      return await callGemini(GEMINI_MODEL, prompt, systemInstruction, apiKey, controller.signal);
+      return await callGeminiWithTransientRetries(GEMINI_MODEL, prompt, systemInstruction, apiKey, controller.signal);
     } catch (error) {
       if (!(error instanceof GeminiHttpError) || !isUnavailableModel404(error)) throw error;
       const suggestedModel = extractSuggestedModel(error.responsePreview);
       if (!suggestedModel || suggestedModel === GEMINI_MODEL) throw error;
       console.info("Retrying Gemini once with Google-suggested model", { previousModel: GEMINI_MODEL, suggestedModel });
-      return await callGemini(suggestedModel, prompt, systemInstruction, apiKey, controller.signal);
+      return await callGeminiWithTransientRetries(suggestedModel, prompt, systemInstruction, apiKey, controller.signal);
     }
   } finally {
     clearTimeout(timeout);
