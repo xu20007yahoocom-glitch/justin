@@ -18,10 +18,10 @@ import type {
 // when a Google project exposes a different current model set.
 const GEMINI_MODEL = process.env.GEMINI_MODEL?.trim() || "gemini-flash-latest";
 const GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta";
-const GEMINI_TIMEOUT_MS = 15_000;
-const GEMINI_TRANSIENT_MAX_RETRIES = 2;
+const GEMINI_TIMEOUT_MS = 25_000;
+const GEMINI_TRANSIENT_MAX_RETRIES = 3;
 const GEMINI_TRANSIENT_BASE_DELAY_MS = 1_000;
-const GEMINI_TRANSIENT_MAX_DELAY_MS = 2_000;
+const GEMINI_TRANSIENT_MAX_DELAY_MS = 4_000;
 
 function isTransientGeminiError(error: unknown): error is GeminiHttpError {
   if (!(error instanceof GeminiHttpError)) return false;
