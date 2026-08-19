@@ -16,7 +16,7 @@ import type {
 
 // Gemini 2.5 Flash is the stable default. An explicit environment override is useful
 // when a Google project exposes a different current model set.
-const GEMINI_MODEL = process.env.GEMINI_MODEL?.trim() || "gemini-2.5-flash";
+const GEMINI_MODEL = process.env.GEMINI_MODEL?.trim() || "gemini-flash-latest";
 const GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta";
 const GEMINI_TIMEOUT_MS = 15_000;
 const AI_CONFIDENCE = "AI 綜合判斷，非即時財報數據" as const;
@@ -210,33 +210,104 @@ function buildPrompt(context: AnalysisContext, dataLimitations: string[]): strin
   return "你是股票研究的文字分析器。只使用 payload 中已有的精確數字；缺漏資料只能定性說明，不得捏造營收、淨利、市值、估值倍率、毛利率、52 週價格或業務佔比。只輸出合法 JSON。\n\nPAYLOAD:\n" + JSON.stringify(payload) + "\n\n輸出 JSON 欄位：recommendation、recommendationReason、confidenceLevel、summary、outlook、risks、technicalSummary、valuation、oneLineSummary、companyPositioning、catalysts、competitors、competitiveAdvantage。";
 }
 
+class GeminiHttpError extends Error {
+  constructor(
+    readonly status: number,
+    readonly model: string,
+    readonly endpoint: string,
+    readonly responsePreview: string
+  ) {
+    super("Gemini HTTP " + status + " for model " + model + ": " + responsePreview);
+    this.name = "GeminiHttpError";
+  }
+}
+
+function isGeminiModelCharacter(character: string): boolean {
+  const code = character.charCodeAt(0);
+  return (
+    (code >= 48 && code <= 57) ||
+    (code >= 65 && code <= 90) ||
+    (code >= 97 && code <= 122) ||
+    character === "-" ||
+    character === "." ||
+    character === "_"
+  );
+}
+
+function extractSuggestedModel(responseText: string): string | null {
+  const marker = "models/";
+  const start = responseText.indexOf(marker);
+  if (start < 0) return null;
+  let end = start + marker.length;
+  while (end < responseText.length && isGeminiModelCharacter(responseText[end])) end += 1;
+  const model = responseText.slice(start + marker.length, end);
+  return model.startsWith("gemini-") ? model : null;
+}
+
+function isUnavailableModel404(error: GeminiHttpError): boolean {
+  if (error.status !== 404) return false;
+  const text = error.responsePreview.toLowerCase();
+  return text.includes("model") && (
+    text.includes("not available") ||
+    text.includes("not found") ||
+    text.includes("shut down") ||
+    text.includes("closed") ||
+    text.includes("unavailable")
+  );
+}
+
+async function callGemini(
+  model: string,
+  prompt: string,
+  systemInstruction: string,
+  apiKey: string,
+  signal: AbortSignal
+): Promise<GeminiAnalysisDraft> {
+  const geminiUrl = new URL(
+    "https://generativelanguage.googleapis.com/v1beta/models/" + encodeURIComponent(model) + ":generateContent"
+  );
+  geminiUrl.searchParams.set("key", apiKey);
+  const endpoint = geminiUrl.origin + geminiUrl.pathname;
+  console.info("Gemini generateContent endpoint", endpoint);
+
+  const response = await fetch(geminiUrl.toString(), {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify({
+      systemInstruction: { parts: [{ text: systemInstruction }] },
+      contents: [{ role: "user", parts: [{ text: prompt }] }],
+      generationConfig: { responseMimeType: "application/json", temperature: 0.2 }
+    }),
+    signal
+  });
+
+  if (!response.ok) {
+    const responsePreview = (await response.text()).slice(0, 600);
+    console.warn("Gemini generateContent failed", { status: response.status, model, endpoint, responsePreview });
+    throw new GeminiHttpError(response.status, model, endpoint, responsePreview);
+  }
+
+  const body = (await response.json()) as GeminiResponse;
+  const responseText = body.candidates?.[0]?.content?.parts?.map((part) => part.text ?? "").join("").trim();
+  if (!responseText) throw new Error("Gemini response contained no text");
+  return JSON.parse(responseText) as GeminiAnalysisDraft;
+}
+
 async function requestGemini(prompt: string, systemInstruction: string): Promise<GeminiAnalysisDraft> {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) throw new Error("GEMINI_API_KEY_MISSING");
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
   try {
-    const geminiUrl = new URL(
-      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent`
-    );
-    geminiUrl.searchParams.set("key", apiKey);
-    // Do not log geminiUrl.toString(): its query contains the API key.
-    console.info("Gemini generateContent endpoint", geminiUrl.origin + geminiUrl.pathname);
-    const response = await fetch(geminiUrl.toString(), { method: "POST", headers: { "Content-Type": "application/json", Accept: "application/json" }, body: JSON.stringify({ systemInstruction: { parts: [{ text: systemInstruction }] }, contents: [{ role: "user", parts: [{ text: prompt }] }], generationConfig: { responseMimeType: "application/json", temperature: 0.2 } }), signal: controller.signal });
-    if (!response.ok) {
-      const responsePreview = (await response.text()).slice(0, 600);
-      console.warn("Gemini generateContent failed", {
-        status: response.status,
-        model: GEMINI_MODEL,
-        endpoint: geminiUrl.origin + geminiUrl.pathname,
-        responsePreview
-      });
-      throw new Error("Gemini HTTP " + response.status + " for model " + GEMINI_MODEL + ": " + responsePreview);
+    try {
+      return await callGemini(GEMINI_MODEL, prompt, systemInstruction, apiKey, controller.signal);
+    } catch (error) {
+      if (!(error instanceof GeminiHttpError) || !isUnavailableModel404(error)) throw error;
+      const suggestedModel = extractSuggestedModel(error.responsePreview);
+      if (!suggestedModel || suggestedModel === GEMINI_MODEL) throw error;
+      console.info("Retrying Gemini once with Google-suggested model", { previousModel: GEMINI_MODEL, suggestedModel });
+      return await callGemini(suggestedModel, prompt, systemInstruction, apiKey, controller.signal);
     }
-    const body = (await response.json()) as GeminiResponse;
-    const responseText = body.candidates?.[0]?.content?.parts?.map((part) => part.text ?? "").join("").trim();
-    if (!responseText) throw new Error("Gemini response contained no text");
-    return JSON.parse(responseText) as GeminiAnalysisDraft;
   } finally {
     clearTimeout(timeout);
   }
