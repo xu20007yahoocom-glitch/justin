@@ -16,7 +16,7 @@ import type {
 
 // Gemini 2.5 Flash is the stable default. An explicit environment override is useful
 // when a Google project exposes a different current model set.
-const GEMINI_MODEL = "gemini-2.5-flash";
+const GEMINI_MODEL = process.env.GEMINI_MODEL?.trim() || "gemini-2.5-flash";
 const GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta";
 const GEMINI_TIMEOUT_MS = 15_000;
 const AI_CONFIDENCE = "AI 綜合判斷，非即時財報數據" as const;
@@ -223,7 +223,16 @@ async function requestGemini(prompt: string, systemInstruction: string): Promise
     // Do not log geminiUrl.toString(): its query contains the API key.
     console.info("Gemini generateContent endpoint", geminiUrl.origin + geminiUrl.pathname);
     const response = await fetch(geminiUrl.toString(), { method: "POST", headers: { "Content-Type": "application/json", Accept: "application/json" }, body: JSON.stringify({ systemInstruction: { parts: [{ text: systemInstruction }] }, contents: [{ role: "user", parts: [{ text: prompt }] }], generationConfig: { responseMimeType: "application/json", temperature: 0.2 } }), signal: controller.signal });
-    if (!response.ok) throw new Error("Gemini HTTP " + response.status + " for model " + GEMINI_MODEL);
+    if (!response.ok) {
+      const responsePreview = (await response.text()).slice(0, 600);
+      console.warn("Gemini generateContent failed", {
+        status: response.status,
+        model: GEMINI_MODEL,
+        endpoint: geminiUrl.origin + geminiUrl.pathname,
+        responsePreview
+      });
+      throw new Error("Gemini HTTP " + response.status + " for model " + GEMINI_MODEL + ": " + responsePreview);
+    }
     const body = (await response.json()) as GeminiResponse;
     const responseText = body.candidates?.[0]?.content?.parts?.map((part) => part.text ?? "").join("").trim();
     if (!responseText) throw new Error("Gemini response contained no text");
