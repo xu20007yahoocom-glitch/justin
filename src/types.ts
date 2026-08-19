@@ -3,6 +3,9 @@ export interface PriceHistoryPoint {
   price: number;
 }
 
+/** 與既有 Yahoo 行情資料提供者相容的歷史價格點名稱。 */
+export type HistoricalDataPoint = PriceHistoryPoint;
+
 export interface StockQuote {
   symbol: string;
   companyName: string;
@@ -243,6 +246,9 @@ export interface CompanyProfile {
 export interface PortfolioItem {
   symbol: string;
   shares: number;
-  averageCost: number;
+  /** 加權平均持有成本；與 PortfolioCalculator 的 persisted 資料格式一致。 */
+  avgCost: number;
+  /** 可選的自動停損觸發價格。 */
+  stopLossPrice?: number;
   [key: string]: unknown;
 }
