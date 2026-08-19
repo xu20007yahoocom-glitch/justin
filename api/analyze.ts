@@ -216,8 +216,13 @@ async function requestGemini(prompt: string, systemInstruction: string): Promise
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
   try {
-    const endpoint = GEMINI_BASE_URL + "/models/" + encodeURIComponent(GEMINI_MODEL) + ":generateContent?key=" + encodeURIComponent(apiKey);
-    const response = await fetch(endpoint, { method: "POST", headers: { "Content-Type": "application/json", Accept: "application/json" }, body: JSON.stringify({ systemInstruction: { parts: [{ text: systemInstruction }] }, contents: [{ role: "user", parts: [{ text: prompt }] }], generationConfig: { responseMimeType: "application/json", temperature: 0.2 } }), signal: controller.signal });
+    const geminiUrl = new URL(
+      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent`
+    );
+    geminiUrl.searchParams.set("key", apiKey);
+    // Do not log geminiUrl.toString(): its query contains the API key.
+    console.info("Gemini generateContent endpoint", geminiUrl.origin + geminiUrl.pathname);
+    const response = await fetch(geminiUrl.toString(), { method: "POST", headers: { "Content-Type": "application/json", Accept: "application/json" }, body: JSON.stringify({ systemInstruction: { parts: [{ text: systemInstruction }] }, contents: [{ role: "user", parts: [{ text: prompt }] }], generationConfig: { responseMimeType: "application/json", temperature: 0.2 } }), signal: controller.signal });
     if (!response.ok) throw new Error("Gemini HTTP " + response.status + " for model " + GEMINI_MODEL);
     const body = (await response.json()) as GeminiResponse;
     const responseText = body.candidates?.[0]?.content?.parts?.map((part) => part.text ?? "").join("").trim();
