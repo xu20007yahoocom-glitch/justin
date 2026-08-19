@@ -16,10 +16,9 @@ import type {
 
 // Gemini 2.5 Flash is the stable default. An explicit environment override is useful
 // when a Google project exposes a different current model set.
-const GEMINI_MODEL = process.env.GEMINI_MODEL?.trim() || "gemini-2.5-flash";
+const GEMINI_MODEL = "gemini-2.5-flash";
 const GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta";
 const GEMINI_TIMEOUT_MS = 15_000;
-const GEMINI_FALLBACK_MODELS = ["gemini-2.5-flash-lite", "gemini-3.5-flash", "gemini-flash-latest"];
 const AI_CONFIDENCE = "AI 綜合判斷，非即時財報數據" as const;
 
 interface GeminiCandidate {
@@ -207,144 +206,27 @@ function buildSystemInstruction(language: string): string {
 }
 
 function buildPrompt(context: AnalysisContext, dataLimitations: string[]): string {
-  const language = localeToLanguageInstruction(context.locale);
-  const aiPayload = {
-    symbol: context.quote.symbol,
-    companyName: context.quote.companyName,
-    marketScope: context.marketScope,
-    finnhubSupported: context.finnhubSupported,
-    quote: {
-      price: context.quote.price,
-      change: context.quote.change,
-      changePercent: context.quote.changePercent,
-      high: context.quote.high,
-      low: context.quote.low,
-      previousClose: context.quote.previousClose,
-      volume: context.quote.volume,
-      lastUpdated: context.quote.lastUpdated
-    },
-    technicals: context.technicals,
-    companyBackground: context.companyBackgroundBase,
-    financialMetrics: context.financialMetrics,
-    topRevenueBusinesses: context.revenueBusinesses,
-    unavailable: context.unavailable,
-    dataLimitations
-  };
-
-  return `請根據下列受控 payload 撰寫分析草稿。你必須使用 ${language}。\n\nPAYLOAD:\n${JSON.stringify(aiPayload)}\n\n僅輸出此 JSON 結構：
-{
-  "recommendation": "BUY" | "HOLD" | "SELL" | "NEUTRAL",
-  "recommendationReason": "定性理由，不得增加未提供的數字",
-  "confidenceLevel": "high" | "medium" | "low",
-  "summary": "2-3 句摘要",
-  "outlook": "短中期定性展望",
-  "risks": ["定性風險"],
-  "technicalSummary": {
-    "movingAverageNote": "僅說明 payload 技術指標",
-    "momentumNote": "僅說明 payload 技術指標",
-    "volumePriceNote": "僅說明 payload 技術指標",
-    "summary": "技術面摘要"
-  },
-  "valuation": {
-    "assessment": "UNDERVALUED" | "FAIR" | "OVERVALUED" | "INSUFFICIENT_DATA",
-    "reasoning"function geminiUrl(model: string, apiKey: string): string {
-  return `${GEMINI_BASE_URL}/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
-}
-
-function geminiRequestBody(prompt: string, systemInstruction: string): string {
-  return JSON.stringify({
-    systemInstruction: { parts: [{ text: systemInstruction }] },
-    contents: [{ role: "user", parts: [{ text: prompt }] }],
-    generationConfig: { responseMimeType: "application/json", temperature: 0.2 }
-  });
-}
-
-function modelSupportsGenerateContent(model: GeminiModelInfo): boolean {
-  const methods = model.supportedGenerationMethods ?? model.supportedActions ?? [];
-  return methods.includes("generateContent");
-}
-
-function modelNameFromResource(resourceName: string | undefined): string {
-  const normalized = typeof resourceName === "string" ? resourceName.trim() : "";
-  return normalized.startsWith("models/") ? normalized.slice("models/".length) : normalized;
-}
-
-async function discoverCompatibleGeminiModels(apiKey: string, signal: AbortSignal): Promise<string[]> {
-  try {
-    const response = await fetch(`${GEMINI_BASE_URL}/models?key=${encodeURIComponent(apiKey)}`, {
-      headers: { Accept: "application/json" },
-      signal
-    });
-    if (!response.ok) {
-      console.warn("Gemini models.list unavailable", { status: response.status });
-      return [];
-    }
-    const body = (await response.json()) as GeminiModelsListResponse;
-    const available = (body.models ?? [])
-      .filter(modelSupportsGenerateContent)
-      .map((model) => modelNameFromResource(model.name))
-      .filter((name) => Boolean(name) && name.includes("flash") && !name.includes("-image") && !name.includes("-live") && !name.includes("-tts"));
-    const priority = [GEMINI_MODEL, ...GEMINI_FALLBACK_MODELS];
-    return [...new Set(available)].sort((left, right) => {
-      const leftRank = priority.indexOf(left);
-      const rightRank = priority.indexOf(right);
-      return (leftRank === -1 ? Number.MAX_SAFE_INTEGER : leftRank) - (rightRank === -1 ? Number.MAX_SAFE_INTEGER : rightRank);
-    });
-  } catch (error) {
-    console.warn("Gemini models.list failed; keeping primary model only", error instanceof Error ? error.message : error);
-    return [];
-  }
-}
-
-async function parseGeminiResponse(response: Response): Promise<GeminiAnalysisDraft> {
-  const body = (await response.json()) as GeminiResponse;
-  const responseText = body.candidates?.[0]?.content?.parts
-    ?.map((part) => part.text ?? "")
-    .join("")
-    .trim();
-  if (!responseText) throw new Error("Gemini response contained no text");
-  return JSON.parse(responseText) as GeminiAnalysisDraft;
+  const payload = { symbol: context.quote.symbol, companyName: context.quote.companyName, marketScope: context.marketScope, finnhubSupported: context.finnhubSupported, quote: context.quote, technicals: context.technicals, companyBackground: context.companyBackgroundBase, financialMetrics: context.financialMetrics, topRevenueBusinesses: context.revenueBusinesses, unavailable: context.unavailable, dataLimitations };
+  return "你是股票研究的文字分析器。只使用 payload 中已有的精確數字；缺漏資料只能定性說明，不得捏造營收、淨利、市值、估值倍率、毛利率、52 週價格或業務佔比。只輸出合法 JSON。\n\nPAYLOAD:\n" + JSON.stringify(payload) + "\n\n輸出 JSON 欄位：recommendation、recommendationReason、confidenceLevel、summary、outlook、risks、technicalSummary、valuation、oneLineSummary、companyPositioning、catalysts、competitors、competitiveAdvantage。";
 }
 
 async function requestGemini(prompt: string, systemInstruction: string): Promise<GeminiAnalysisDraft> {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) throw new Error("GEMINI_API_KEY_MISSING");
-
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
-  const request = (model: string) => fetch(geminiUrl(model, apiKey), {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json" },
-    body: geminiRequestBody(prompt, systemInstruction),
-    signal: controller.signal
-  });
-
   try {
-    const primaryResponse = await request(GEMINI_MODEL);
-    if (primaryResponse.ok) return parseGeminiResponse(primaryResponse);
-    if (primaryResponse.status !== 404) {
-      throw new Error(`Gemini HTTP ${primaryResponse.status} for model ${GEMINI_MODEL}`);
-    }
-
-    // A 404 can mean this API key is valid but its Google project cannot access the
-    // configured model. List only models available to this key, then retry compatible Flash models.
-    const candidates = (await discoverCompatibleGeminiModels(apiKey, controller.signal))
-      .filter((model) => model !== GEMINI_MODEL);
-    for (const model of candidates) {
-      const response = await request(model);
-      if (response.ok) {
-        console.info("Gemini fallback model selected", { model });
-        return parseGeminiResponse(response);
-      }
-      if (response.status !== 404) throw new Error(`Gemini HTTP ${response.status} for model ${model}`);
-    }
-
-    throw new Error(`Gemini HTTP 404: no compatible generateContent model for configured key; primary=${GEMINI_MODEL}; discovered=${candidates.join(",") || "none"}`);
+    const endpoint = GEMINI_BASE_URL + "/models/" + encodeURIComponent(GEMINI_MODEL) + ":generateContent?key=" + encodeURIComponent(apiKey);
+    const response = await fetch(endpoint, { method: "POST", headers: { "Content-Type": "application/json", Accept: "application/json" }, body: JSON.stringify({ systemInstruction: { parts: [{ text: systemInstruction }] }, contents: [{ role: "user", parts: [{ text: prompt }] }], generationConfig: { responseMimeType: "application/json", temperature: 0.2 } }), signal: controller.signal });
+    if (!response.ok) throw new Error("Gemini HTTP " + response.status + " for model " + GEMINI_MODEL);
+    const body = (await response.json()) as GeminiResponse;
+    const responseText = body.candidates?.[0]?.content?.parts?.map((part) => part.text ?? "").join("").trim();
+    if (!responseText) throw new Error("Gemini response contained no text");
+    return JSON.parse(responseText) as GeminiAnalysisDraft;
   } finally {
     clearTimeout(timeout);
   }
 }
-
 function shapeAnalysisResult(raw: GeminiAnalysisDraft, context: AnalysisContext, dataLimitations: string[]): AnalysisResult {
   const technicals = context.technicals;
   const requestedConfidence = raw.confidenceLevel ?? "low";
