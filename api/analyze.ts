@@ -14,9 +14,12 @@ import type {
   SourcedField
 } from "../src/types.js";
 
-const GEMINI_MODEL = "gemini-2.5-flash";
+// Gemini 2.5 Flash is the stable default. An explicit environment override is useful
+// when a Google project exposes a different current model set.
+const GEMINI_MODEL = process.env.GEMINI_MODEL?.trim() || "gemini-2.5-flash";
 const GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta";
 const GEMINI_TIMEOUT_MS = 15_000;
+const GEMINI_FALLBACK_MODELS = ["gemini-2.5-flash-lite", "gemini-3.5-flash", "gemini-flash-latest"];
 const AI_CONFIDENCE = "AI 綜合判斷，非即時財報數據" as const;
 
 interface GeminiCandidate {
@@ -25,6 +28,16 @@ interface GeminiCandidate {
 
 interface GeminiResponse {
   candidates?: GeminiCandidate[];
+}
+
+interface GeminiModelInfo {
+  name?: string;
+  supportedGenerationMethods?: string[];
+  supportedActions?: string[];
+}
+
+interface GeminiModelsListResponse {
+  models?: GeminiModelInfo[];
 }
 
 interface GeminiAnalysisDraft {
@@ -234,15 +247,62 @@ function buildPrompt(context: AnalysisContext, dataLimitations: string[]): strin
   },
   "valuation": {
     "assessment": "UNDERVALUED" | "FAIR" | "OVERVALUED" | "INSUFFICIENT_DATA",
-    "reasoning": "只能使用 payload 已存在的數值；否則為定性且說明需查證"
-  },
-  "oneLineSummary": "一句投資看點／狀態",
-  "companyPositioning": "公司定位定性補述",
-  "catalysts": [{ "title": "文字", "direction": "正面" | "負面" | "中性" | "待驗證", "rationale": "文字", "evidence": "僅重述 payload 已有事實，否則留空" }],
-  "topRevenueBusinesses": [{ "name": "既有 API 業務名或定性業務名", "description": "定性說明，不含數字或百分比" }],
-  "competitors": [{ "name": "同業名稱", "comparison": "定性比較" }],
-  "competitiveAdvantage": { "summary": "定性護城河", "limitations": "需查證或限制" }
-}`;
+    "reasoning"function geminiUrl(model: string, apiKey: string): string {
+  return `${GEMINI_BASE_URL}/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
+}
+
+function geminiRequestBody(prompt: string, systemInstruction: string): string {
+  return JSON.stringify({
+    systemInstruction: { parts: [{ text: systemInstruction }] },
+    contents: [{ role: "user", parts: [{ text: prompt }] }],
+    generationConfig: { responseMimeType: "application/json", temperature: 0.2 }
+  });
+}
+
+function modelSupportsGenerateContent(model: GeminiModelInfo): boolean {
+  const methods = model.supportedGenerationMethods ?? model.supportedActions ?? [];
+  return methods.includes("generateContent");
+}
+
+function modelNameFromResource(resourceName: string | undefined): string {
+  return typeof resourceName === "string" ? resourceName.replace(/^models\//, "").trim() : "";
+}
+
+async function discoverCompatibleGeminiModels(apiKey: string, signal: AbortSignal): Promise<string[]> {
+  try {
+    const response = await fetch(`${GEMINI_BASE_URL}/models?key=${encodeURIComponent(apiKey)}`, {
+      headers: { Accept: "application/json" },
+      signal
+    });
+    if (!response.ok) {
+      console.warn("Gemini models.list unavailable", { status: response.status });
+      return [];
+    }
+    const body = (await response.json()) as GeminiModelsListResponse;
+    const available = (body.models ?? [])
+      .filter(modelSupportsGenerateContent)
+      .map((model) => modelNameFromResource(model.name))
+      .filter((name) => Boolean(name) && name.includes("flash") && !name.includes("-image") && !name.includes("-live") && !name.includes("-tts"));
+    const priority = [GEMINI_MODEL, ...GEMINI_FALLBACK_MODELS];
+    return [...new Set(available)].sort((left, right) => {
+      const leftRank = priority.indexOf(left);
+      const rightRank = priority.indexOf(right);
+      return (leftRank === -1 ? Number.MAX_SAFE_INTEGER : leftRank) - (rightRank === -1 ? Number.MAX_SAFE_INTEGER : rightRank);
+    });
+  } catch (error) {
+    console.warn("Gemini models.list failed; keeping primary model only", error instanceof Error ? error.message : error);
+    return [];
+  }
+}
+
+async function parseGeminiResponse(response: Response): Promise<GeminiAnalysisDraft> {
+  const body = (await response.json()) as GeminiResponse;
+  const responseText = body.candidates?.[0]?.content?.parts
+    ?.map((part) => part.text ?? "")
+    .join("")
+    .trim();
+  if (!responseText) throw new Error("Gemini response contained no text");
+  return JSON.parse(responseText) as GeminiAnalysisDraft;
 }
 
 async function requestGemini(prompt: string, systemInstruction: string): Promise<GeminiAnalysisDraft> {
@@ -251,32 +311,34 @@ async function requestGemini(prompt: string, systemInstruction: string): Promise
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
-  try {
-    const response = await fetch(
-      `${GEMINI_BASE_URL}/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent?key=${encodeURIComponent(apiKey)}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Accept: "application/json" },
-        body: JSON.stringify({
-          systemInstruction: { parts: [{ text: systemInstruction }] },
-          contents: [{ role: "user", parts: [{ text: prompt }] }],
-          generationConfig: {
-            responseMimeType: "application/json",
-            temperature: 0.2
-          }
-        }),
-        signal: controller.signal
-      }
-    );
+  const request = (model: string) => fetch(geminiUrl(model, apiKey), {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: geminiRequestBody(prompt, systemInstruction),
+    signal: controller.signal
+  });
 
-    if (!response.ok) throw new Error(`Gemini HTTP ${response.status}`);
-    const body = (await response.json()) as GeminiResponse;
-    const responseText = body.candidates?.[0]?.content?.parts
-      ?.map((part) => part.text ?? "")
-      .join("")
-      .trim();
-    if (!responseText) throw new Error("Gemini response contained no text");
-    return JSON.parse(responseText) as GeminiAnalysisDraft;
+  try {
+    const primaryResponse = await request(GEMINI_MODEL);
+    if (primaryResponse.ok) return parseGeminiResponse(primaryResponse);
+    if (primaryResponse.status !== 404) {
+      throw new Error(`Gemini HTTP ${primaryResponse.status} for model ${GEMINI_MODEL}`);
+    }
+
+    // A 404 can mean this API key is valid but its Google project cannot access the
+    // configured model. List only models available to this key, then retry compatible Flash models.
+    const candidates = (await discoverCompatibleGeminiModels(apiKey, controller.signal))
+      .filter((model) => model !== GEMINI_MODEL);
+    for (const model of candidates) {
+      const response = await request(model);
+      if (response.ok) {
+        console.info("Gemini fallback model selected", { model });
+        return parseGeminiResponse(response);
+      }
+      if (response.status !== 404) throw new Error(`Gemini HTTP ${response.status} for model ${model}`);
+    }
+
+    throw new Error(`Gemini HTTP 404: no compatible generateContent model for configured key; primary=${GEMINI_MODEL}; discovered=${candidates.join(",") || "none"}`);
   } finally {
     clearTimeout(timeout);
   }
