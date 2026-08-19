@@ -1,33 +1,60 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
-import { GoogleGenAI } from "@google/genai";
 import { STOCKS_METADATA, fetchStockFromYahoo } from "../lib/stocksData.js";
+import { buildAnalysisContext } from "../lib/analysisData.js";
 import { getSimulatedAnalysis } from "../lib/simulatedAnalysis.js";
-import { computeTechnicalIndicators, deriveConfidence, buildDataLimitations } from "../lib/technicalIndicators.js";
-import type { AnalysisContext, AnalysisResult, ConfidenceLevel } from "../src/types.js";
+import { buildDataLimitations, computeTechnicalIndicators, deriveConfidence } from "../lib/technicalIndicators.js";
+import type {
+  AnalysisContext,
+  AnalysisResult,
+  Catalyst,
+  CatalystDirection,
+  CompetitiveAdvantage,
+  Competitor,
+  RevenueBusiness,
+  SourcedField
+} from "../src/types.js";
 
-const apiKey = process.env.GEMINI_API_KEY;
-const ai = apiKey ? new GoogleGenAI({ apiKey }) : null;
+const GEMINI_MODEL = "gemini-2.5-flash";
+const GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta";
+const GEMINI_TIMEOUT_MS = 15_000;
+const AI_CONFIDENCE = "AI 綜合判斷，非即時財報數據" as const;
 
-/**
- * Build the "analysis material package" passed to Gemini. Today only
- * `quote` (real Yahoo Finance data) and `technicals` (real numbers
- * computed by lib/technicalIndicators.ts) are populated. `fundamentals`
- * and `analystRatings` are reserved extension points — always null right
- * now — so that wiring in a real financial-statement/analyst-consensus
- * data source later only requires filling these two fields, without
- * touching the prompt-assembly or response-shaping logic below.
- */
-async function buildAnalysisContext(symbol: string, locale: string): Promise<AnalysisContext> {
-  const quote = await fetchStockFromYahoo(symbol);
-  const technicals = computeTechnicalIndicators(quote);
+interface GeminiCandidate {
+  content?: { parts?: Array<{ text?: string }> };
+}
 
-  return {
-    quote,
-    technicals,
-    fundamentals: null, // reserved: no financial-statement data source wired up yet
-    analystRatings: null, // reserved: no analyst-consensus data source wired up yet
-    locale
+interface GeminiResponse {
+  candidates?: GeminiCandidate[];
+}
+
+interface GeminiAnalysisDraft {
+  recommendation?: "BUY" | "HOLD" | "SELL" | "NEUTRAL";
+  recommendationReason?: string;
+  confidenceLevel?: "high" | "medium" | "low";
+  summary?: string;
+  outlook?: string;
+  risks?: unknown[];
+  technicalSummary?: {
+    movingAverageNote?: string;
+    momentumNote?: string;
+    volumePriceNote?: string;
+    summary?: string;
   };
+  valuation?: {
+    assessment?: "UNDERVALUED" | "FAIR" | "OVERVALUED" | "INSUFFICIENT_DATA";
+    reasoning?: string;
+  };
+  oneLineSummary?: string;
+  companyPositioning?: string;
+  catalysts?: Array<{
+    title?: string;
+    direction?: CatalystDirection;
+    rationale?: string;
+    evidence?: string;
+  }>;
+  topRevenueBusinesses?: Array<{ name?: string; description?: string }>;
+  competitors?: Array<{ name?: string; comparison?: string }>;
+  competitiveAdvantage?: { summary?: string; limitations?: string };
 }
 
 function localeToLanguageInstruction(locale: string): string {
@@ -35,297 +62,327 @@ function localeToLanguageInstruction(locale: string): string {
   if (normalized.startsWith("zh-tw") || normalized.startsWith("zh-hk") || normalized === "zh-hant") {
     return "繁體中文（台灣用語）";
   }
-  if (normalized.startsWith("zh")) {
-    return "繁體中文";
-  }
+  if (normalized.startsWith("zh")) return "繁體中文";
   if (normalized.startsWith("ja")) return "日本語";
   if (normalized.startsWith("ko")) return "한국어";
   if (normalized.startsWith("en")) return "English";
-  // Default: Traditional Chinese, matching this app's existing baseline UI language.
   return "繁體中文";
 }
 
-/**
- * Build the Gemini prompt. All quantitative technical figures come from
- * `context.technicals` (real computed numbers) and are injected verbatim
- * into the prompt as ground truth that Gemini must narrate, not invent.
- * Gemini is explicitly forbidden from fabricating any other precise
- * numeric figures (EPS, revenue, PE ratio, etc.) it does not actually
- * have grounded data for.
- */
+function text(value: unknown, limit = 800): string {
+  return typeof value === "string" ? value.trim().slice(0, limit) : "";
+}
+
+function aiField(value: string): SourcedField<string> {
+  return {
+    value: value || null,
+    dataConfidence: AI_CONFIDENCE,
+    source: "Gemini 推理",
+    endpoint: null,
+    sourceField: null,
+    fetchedAt: null,
+    periodEnd: null,
+    isStale: false,
+    unavailableReason: value ? null : "尚無可用資料"
+  };
+}
+
+function blankRevenueBusiness(name: string, description: string): RevenueBusiness {
+  const unavailable = <T>(): SourcedField<T> => ({
+    value: null,
+    dataConfidence: AI_CONFIDENCE,
+    source: "Gemini 推理",
+    endpoint: null,
+    sourceField: null,
+    fetchedAt: null,
+    periodEnd: null,
+    isStale: false,
+    unavailableReason: "公司未揭露業務營收拆分"
+  });
+
+  return {
+    name: aiField(name),
+    description: aiField(description),
+    revenueSharePercent: unavailable<number>(),
+    revenueAmount: unavailable<number>(),
+    revenueUnit: unavailable<string>(),
+    axis: unavailable<string>()
+  };
+}
+
+function toCatalysts(input: GeminiAnalysisDraft["catalysts"]): Catalyst[] {
+  if (!Array.isArray(input)) return [];
+  return input
+    .map((item) => {
+      const direction: CatalystDirection =
+        item?.direction === "正面" || item?.direction === "負面" || item?.direction === "中性"
+          ? item.direction
+          : "待驗證";
+      return {
+        title: aiField(text(item?.title, 180)),
+        direction: {
+          ...aiField(direction),
+          value: direction,
+          sourceField: null
+        },
+        rationale: aiField(text(item?.rationale)),
+        evidence: aiField(text(item?.evidence))
+      };
+    })
+    .filter((item) => Boolean(item.title.value))
+    .slice(0, 5);
+}
+
+function toCompetitors(input: GeminiAnalysisDraft["competitors"]): Competitor[] {
+  if (!Array.isArray(input)) return [];
+  return input
+    .map((item) => ({
+      name: aiField(text(item?.name, 160)),
+      comparison: aiField(text(item?.comparison))
+    }))
+    .filter((item) => Boolean(item.name.value))
+    .slice(0, 5);
+}
+
+function toCompetitiveAdvantage(input: GeminiAnalysisDraft["competitiveAdvantage"]): CompetitiveAdvantage {
+  return {
+    summary: aiField(text(input?.summary)),
+    limitations: aiField(text(input?.limitations))
+  };
+}
+
+function mergeRevenueBusinesses(
+  apiBusinesses: RevenueBusiness[],
+  generatedBusinesses: GeminiAnalysisDraft["topRevenueBusinesses"]
+): RevenueBusiness[] {
+  const generatedByName = new Map(
+    (Array.isArray(generatedBusinesses) ? generatedBusinesses : [])
+      .map((item) => [text(item?.name, 160).toLowerCase(), text(item?.description)] as const)
+      .filter(([name]) => Boolean(name))
+  );
+
+  if (apiBusinesses.length > 0) {
+    return apiBusinesses.map((business) => {
+      const key = (business.name.value ?? "").toLowerCase();
+      const generatedDescription = generatedByName.get(key) ?? "";
+      return {
+        ...business,
+        description: generatedDescription ? aiField(generatedDescription) : business.description
+      };
+    });
+  }
+
+  // The model may provide qualitative business descriptions when the issuer did not disclose a
+  // reliable breakdown. Explicitly keep every numerical revenue field null.
+  return (Array.isArray(generatedBusinesses) ? generatedBusinesses : [])
+    .map((item) => blankRevenueBusiness(text(item?.name, 160), text(item?.description)))
+    .filter((item) => Boolean(item.name.value))
+    .slice(0, 5);
+}
+
+function buildSystemInstruction(language: string): string {
+  return `你是股票研究的文字分析器。所有輸出一律使用 ${language}。
+
+資料來源分層（必須遵守）：
+1. payload 的 SourcedField 中 value 非 null 且 dataConfidence 為「API 實測」時，是已取得的真實資料。不得修改、重新計算、推斷成另一個數字，或聲稱這些資料來自你自己搜尋。
+2. payload 未提供、value 為 null、或 unavailable 陣列列出的欄位，才可由你給出定性、研究型的文字補述；每一個這類補述都會由伺服器標記為「AI 綜合判斷，非即時財報數據」。
+3. 你絕不可產生 payload 中不存在的精確 P/E、P/B、EPS、ROE、毛利率、營收、淨利、市值、52 週價格、業務營收金額或佔比。缺資料時用「需查證」或保持定性敘述。
+4. topRevenueBusinesses 的 revenueSharePercent 與 revenueAmount 完全由伺服器控制。你只能寫 description，不可補數字或百分比；如果 API 沒資料，伺服器會顯示「佔比未知」。
+5. 對港股與 A 股（marketScope 為 HK 或 CN，或 finnhubSupported=false），不得暗示使用了即時 Finnhub 財報；所有研究性敘述都是「AI 綜合判斷，非即時財報數據」。
+6. catalysts、competitors、competitiveAdvantage 是定性研究，不能編造近期公告、事件、財務數字、市占或精確時間點。若無充分背景，輸出空陣列或「需查證」。
+7. 僅輸出合法 JSON；不要包覆 Markdown、不要輸出資料來源以外的前言。`;
+}
+
 function buildPrompt(context: AnalysisContext, dataLimitations: string[]): string {
-  const { quote, technicals } = context;
   const language = localeToLanguageInstruction(context.locale);
+  const aiPayload = {
+    symbol: context.quote.symbol,
+    companyName: context.quote.companyName,
+    marketScope: context.marketScope,
+    finnhubSupported: context.finnhubSupported,
+    quote: {
+      price: context.quote.price,
+      change: context.quote.change,
+      changePercent: context.quote.changePercent,
+      high: context.quote.high,
+      low: context.quote.low,
+      previousClose: context.quote.previousClose,
+      volume: context.quote.volume,
+      lastUpdated: context.quote.lastUpdated
+    },
+    technicals: context.technicals,
+    companyBackground: context.companyBackgroundBase,
+    financialMetrics: context.financialMetrics,
+    topRevenueBusinesses: context.revenueBusinesses,
+    unavailable: context.unavailable,
+    dataLimitations
+  };
 
-  const technicalFacts = `
-- 目前股價: ${quote.price} (變動: ${quote.change} / ${quote.changePercent}%)
-- 當日高/低: ${quote.high} / ${quote.low}，前收盤: ${quote.previousClose}
-- 當日成交量: ${quote.volume}
-- 短期均線 (SMA, ${technicals.smaShortPeriod ?? "N/A"} 期): ${technicals.smaShort ?? "資料不足"}
-- 長期均線 (SMA, ${technicals.smaLongPeriod ?? "N/A"} 期): ${technicals.smaLong ?? "資料不足"}
-- 趨勢判定 (由均線關係計算): ${technicals.trend}
-- 動能 (Rate of Change, %): ${technicals.momentumPercent ?? "資料不足"}
-- 波動率 (價格變動標準差, %): ${technicals.volatilityPercent ?? "資料不足"}
-- 支撐位估計: ${technicals.supportLevel ?? "資料不足"}
-- 壓力位估計: ${technicals.resistanceLevel ?? "資料不足"}
-- 目前價格於支撐-壓力區間位置 (0=支撐, 1=壓力): ${technicals.pricePositionInRange ?? "資料不足"}
-- 成交量說明: ${technicals.volumeNote}
-- 歷史資料點數: ${technicals.historyPoints}
-- 技術資料充足度: ${technicals.dataSufficiency}`;
-
-  return `你是一位專業的股票分析師。請針對股票 ${context.quote.symbol}（${context.quote.companyName}）撰寫一份結構化的投資分析報告。
-
-## 你可以使用的「真實數據」（以下數字皆為系統實際計算/取得的真實數據，你必須完全依據這些數字進行技術面與估值判斷，不可自行更改或重新[...]
-${technicalFacts}
-
-## 已知的資料限制（你必須在分析中誠實反映這些限制，不可假裝擁有這些資料）：
-${dataLimitations.map((l) => `- ${l}`).join("\n")}
-
-## 硬性規則（違反視為分析失敗）：
-1. 任何具體數值型的技術指標（均線、動能、支撐/壓力、波動率）**只能使用上方「真實數據」提供的數字**，禁止自行編造或臆測其他數值型技術��[...]
-2. 基本面數據（EPS、營收、毛利率、ROE、本益比、股利率等精確數值）**你沒有可靠的即時財報數據來源**。如果你不確定，必須明確使用「估計」「[...]
-3. 「valuation」（估值判斷）只能依據上方「目前價格於支撐-壓力區間位置」等真實數據，以及你對該公司的一般性產業認知做「相對評價」（偏貴/��[...]
-4. 你可以使用你的知識與（若可用）即時搜尋能力，補充該公司近期新聞、產業地位、催化劑等「質化」資訊，但這些內容必須清楚是敘述性描述，�[...]
-5. 所有文字輸出請使用「${language}」撰寫。
-6. 「confidenceLevel」欄位請你依據資料完整度誠實給出 "high" | "medium" | "low"（系統會在你的回答之後再做一次強制校正，若資料不足你給了 "high" 系統會[...]
-7. 「dataLimitations」欄位請直接原樣輸出上方列出的「已知的資料限制」清單（可用你的語言重新表述，但語意必須一致，不可省略）。
-
-## 請以下列 JSON 結構輸出（欄位名稱與型別必須完全符合，不可增減欄位名稱）：
+  return `請根據下列受控 payload 撰寫分析草稿。你必須使用 ${language}。\n\nPAYLOAD:\n${JSON.stringify(aiPayload)}\n\n僅輸出此 JSON 結構：
 {
   "recommendation": "BUY" | "HOLD" | "SELL" | "NEUTRAL",
-  "recommendationReason": "一句話說明推薦理由",
+  "recommendationReason": "定性理由，不得增加未提供的數字",
   "confidenceLevel": "high" | "medium" | "low",
-  "dataLimitations": ["字串陣列，說明本次分析的資料限制"],
+  "summary": "2-3 句摘要",
+  "outlook": "短中期定性展望",
+  "risks": ["定性風險"],
   "technicalSummary": {
-    "trend": "UP" | "DOWN" | "SIDEWAYS",
-    "movingAverageNote": "對均線關係的文字解讀（依據上方真實均線數字）",
-    "momentumNote": "對動能數字的文字解讀",
-    "volumePriceNote": "承接成交量說明，補充解讀但不可新增未提供的假設",
-    "supportLevel": ${technicals.supportLevel ?? "null"},
-    "resistanceLevel": ${technicals.resistanceLevel ?? "null"},
-    "summary": "技術面總結段落（2-3句）"
+    "movingAverageNote": "僅說明 payload 技術指標",
+    "momentumNote": "僅說明 payload 技術指標",
+    "volumePriceNote": "僅說明 payload 技術指標",
+    "summary": "技術面摘要"
   },
   "valuation": {
     "assessment": "UNDERVALUED" | "FAIR" | "OVERVALUED" | "INSUFFICIENT_DATA",
-    "reasoning": "說明依據，禁止捏造 PE/PB 等具體比率數字"
+    "reasoning": "只能使用 payload 已存在的數值；否則為定性且說明需查證"
   },
-  "catalysts": [
-    { "type": "bullish" | "bearish", "description": "字串" }
-  ],
-  "risks": ["風險提示字串陣列，2-4項"],
-  "summary": "整體摘要（2-3句）",
-  "outlook": "短中長期展望（2-3句）",
-  "oneSentenceSummary": "一句話總結的投資論點",
-  "companyBackground": "公司背景段落",
-  "top3RevenueSegment": ["前三大營收業務"],
-  "competitors": ["最多3個主要競爭對手"],
-  "advantages": ["2-3項核心競爭優勢/護城河（質化描述，不做星級評分）"],
-  "recentNews": [
-    { "title": "字串", "source": "字串", "sentiment": "positive" | "negative" | "neutral", "url": "字串" }
-  ]
+  "oneLineSummary": "一句投資看點／狀態",
+  "companyPositioning": "公司定位定性補述",
+  "catalysts": [{ "title": "文字", "direction": "正面" | "負面" | "中性" | "待驗證", "rationale": "文字", "evidence": "僅重述 payload 已有事實，否則留空" }],
+  "topRevenueBusinesses": [{ "name": "既有 API 業務名或定性業務名", "description": "定性說明，不含數字或百分比" }],
+  "competitors": [{ "name": "同業名稱", "comparison": "定性比較" }],
+  "competitiveAdvantage": { "summary": "定性護城河", "limitations": "需查證或限制" }
+}`;
 }
 
-僅輸出符合上述結構的合法 JSON，不要加入任何 JSON 以外的文字或 Markdown 標記。`;
+async function requestGemini(prompt: string, systemInstruction: string): Promise<GeminiAnalysisDraft> {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) throw new Error("GEMINI_API_KEY_MISSING");
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
+  try {
+    const response = await fetch(
+      `${GEMINI_BASE_URL}/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent?key=${encodeURIComponent(apiKey)}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({
+          systemInstruction: { parts: [{ text: systemInstruction }] },
+          contents: [{ role: "user", parts: [{ text: prompt }] }],
+          generationConfig: {
+            responseMimeType: "application/json",
+            temperature: 0.2
+          }
+        }),
+        signal: controller.signal
+      }
+    );
+
+    if (!response.ok) throw new Error(`Gemini HTTP ${response.status}`);
+    const body = (await response.json()) as GeminiResponse;
+    const responseText = body.candidates?.[0]?.content?.parts
+      ?.map((part) => part.text ?? "")
+      .join("")
+      .trim();
+    if (!responseText) throw new Error("Gemini response contained no text");
+    return JSON.parse(responseText) as GeminiAnalysisDraft;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
-/** Normalize/repair whatever Gemini returns into a guaranteed-complete
- *  AnalysisResult, filling any missing/malformed fields with safe
- *  defaults rather than letting a partial LLM response reach the
- *  frontend. The server-computed confidenceLevel cap is enforced here,
- *  not merely requested via prompt wording. */
-function shapeAnalysisResult(
-  raw: any,
-  context: AnalysisContext,
-  dataLimitations: string[],
-  sources: { title: string; uri: string }[]
-): AnalysisResult {
+function shapeAnalysisResult(raw: GeminiAnalysisDraft, context: AnalysisContext, dataLimitations: string[]): AnalysisResult {
   const technicals = context.technicals;
-
-  const llmConfidence: ConfidenceLevel =
-    raw?.confidenceLevel === "high" || raw?.confidenceLevel === "medium" || raw?.confidenceLevel === "low"
-      ? raw.confidenceLevel
-      : "low";
-
-  // Enforce the confidence cap server-side: never trust the LLM alone to
-  // self-limit when fundamentals/analystRatings are missing.
-  const cappedConfidence = deriveConfidence(
-    technicals.dataSufficiency,
-    Boolean(context.fundamentals),
-    Boolean(context.analystRatings)
-  );
-  const confidenceRank: Record<ConfidenceLevel, number> = { high: 3, medium: 2, low: 1 };
-  const confidenceLevel: ConfidenceLevel =
-    confidenceRank[llmConfidence] <= confidenceRank[cappedConfidence] ? llmConfidence : cappedConfidence;
-
-  const recommendation = ["BUY", "HOLD", "SELL", "NEUTRAL"].includes(raw?.recommendation)
+  const requestedConfidence = raw.confidenceLevel ?? "low";
+  const cappedConfidence = deriveConfidence(technicals.dataSufficiency, Boolean(context.fundamentals), false);
+  const rank = { high: 3, medium: 2, low: 1 } as const;
+  const confidenceLevel = rank[requestedConfidence] <= rank[cappedConfidence] ? requestedConfidence : cappedConfidence;
+  const recommendation = raw.recommendation === "BUY" || raw.recommendation === "HOLD" || raw.recommendation === "SELL"
     ? raw.recommendation
     : "NEUTRAL";
-
-  const catalysts = Array.isArray(raw?.catalysts)
-    ? raw.catalysts
-        .filter((c: any) => c && typeof c.description === "string")
-        .map((c: any) => ({
-          type: c.type === "bearish" ? "bearish" : "bullish",
-          description: c.description
-        }))
-    : [];
-
-  const risks = Array.isArray(raw?.risks) ? raw.risks.filter((r: any) => typeof r === "string") : [];
-
-  const assessment = ["UNDERVALUED", "FAIR", "OVERVALUED", "INSUFFICIENT_DATA"].includes(raw?.valuation?.assessment)
+  const assessment = raw.valuation?.assessment === "UNDERVALUED" || raw.valuation?.assessment === "FAIR" || raw.valuation?.assessment === "OVERVALUED"
     ? raw.valuation.assessment
     : "INSUFFICIENT_DATA";
 
   return {
+    schemaVersion: "1.0",
     symbol: context.quote.symbol,
-    companyName: context.quote.companyName,
-    lastAnalyzed: new Date().toLocaleString(),
-
+    finnhubSymbol: context.finnhubSymbol,
+    marketScope: context.marketScope,
+    generatedAt: new Date().toISOString(),
+    companyName: context.companyBackgroundBase.companyName.value ?? context.quote.companyName,
+    lastAnalyzed: new Date().toISOString(),
+    companyBackground: {
+      ...context.companyBackgroundBase,
+      positioning: aiField(text(raw.companyPositioning))
+    },
+    oneLineSummary: aiField(text(raw.oneLineSummary, 300)),
+    catalysts: toCatalysts(raw.catalysts),
+    topRevenueBusinesses: mergeRevenueBusinesses(context.revenueBusinesses, raw.topRevenueBusinesses),
+    competitors: toCompetitors(raw.competitors),
+    competitiveAdvantage: toCompetitiveAdvantage(raw.competitiveAdvantage),
+    financialMetrics: context.financialMetrics,
     recommendation,
-    recommendationReason: typeof raw?.recommendationReason === "string" ? raw.recommendationReason : "",
+    recommendationReason: text(raw.recommendationReason),
     confidenceLevel,
-    dataLimitations:
-      Array.isArray(raw?.dataLimitations) && raw.dataLimitations.length > 0
-        ? raw.dataLimitations.filter((d: any) => typeof d === "string")
-        : dataLimitations,
-
+    dataLimitations,
     technicalSummary: {
-      trend: technicals.trend, // always the server-computed real trend, never the LLM's
-      movingAverageNote: typeof raw?.technicalSummary?.movingAverageNote === "string" ? raw.technicalSummary.movingAverageNote : "",
-      momentumNote: typeof raw?.technicalSummary?.momentumNote === "string" ? raw.technicalSummary.momentumNote : "",
-      volumePriceNote: typeof raw?.technicalSummary?.volumePriceNote === "string" ? raw.technicalSummary.volumePriceNote : technicals.volumeNote,
+      trend: technicals.trend,
+      movingAverageNote: text(raw.technicalSummary?.movingAverageNote),
+      momentumNote: text(raw.technicalSummary?.momentumNote),
+      volumePriceNote: text(raw.technicalSummary?.volumePriceNote) || technicals.volumeNote,
       supportLevel: technicals.supportLevel,
       resistanceLevel: technicals.resistanceLevel,
-      summary: typeof raw?.technicalSummary?.summary === "string" ? raw.technicalSummary.summary : ""
+      summary: text(raw.technicalSummary?.summary)
     },
-
-    valuation: {
-      assessment,
-      reasoning: typeof raw?.valuation?.reasoning === "string" ? raw.valuation.reasoning : ""
-    },
-
-    catalysts,
-    risks,
-
-    summary: typeof raw?.summary === "string" ? raw.summary : "",
-    outlook: typeof raw?.outlook === "string" ? raw.outlook : "",
-    oneSentenceSummary: typeof raw?.oneSentenceSummary === "string" ? raw.oneSentenceSummary : "",
-    companyBackground: typeof raw?.companyBackground === "string" ? raw.companyBackground : "",
-    top3RevenueSegment: Array.isArray(raw?.top3RevenueSegment) ? raw.top3RevenueSegment.filter((s: any) => typeof s === "string") : [],
-    competitors: Array.isArray(raw?.competitors) ? raw.competitors.filter((s: any) => typeof s === "string") : [],
-    advantages: Array.isArray(raw?.advantages) ? raw.advantages.filter((s: any) => typeof s === "string") : [],
-
-    recentNews: Array.isArray(raw?.recentNews)
-      ? raw.recentNews
-          .filter((n: any) => n && typeof n.title === "string")
-          .map((n: any) => ({
-            title: n.title,
-            source: typeof n.source === "string" ? n.source : "",
-            sentiment: n.sentiment === "positive" || n.sentiment === "negative" ? n.sentiment : "neutral",
-            url: typeof n.url === "string" ? n.url : undefined
-          }))
-      : [],
-    sources: sources.slice(0, 5)
+    valuation: { assessment, reasoning: text(raw.valuation?.reasoning) },
+    risks: Array.isArray(raw.risks) ? raw.risks.map((risk) => text(risk, 300)).filter(Boolean).slice(0, 5) : [],
+    summary: text(raw.summary),
+    outlook: text(raw.outlook),
+    recentNews: [],
+    sources: []
   };
 }
 
-export default async function handler(req: VercelRequest, res: VercelResponse) {
+export default async function handler(req: VercelRequest, res: VercelResponse): Promise<void> {
   if (req.method !== "POST") {
-    return res.status(405).json({ error: "Method not allowed" });
+    res.status(405).json({ error: "Method not allowed" });
+    return;
   }
 
-  let body: any = req.body;
+  let body: unknown = req.body;
   try {
     if (typeof body === "string") body = JSON.parse(body);
   } catch {
-    return res.status(400).json({ error: "Invalid JSON body" });
+    res.status(400).json({ error: "Invalid JSON body" });
+    return;
   }
 
-  const symbol = body?.symbol;
-  if (!symbol || !STOCKS_METADATA[symbol]) {
-    return res.status(400).json({ error: "Invalid symbol provided" });
+  const request = body as { symbol?: unknown; locale?: unknown };
+  const symbol = typeof request.symbol === "string" ? request.symbol.trim().toUpperCase() : "";
+  // Permit supported market suffixes so a non-US ticker can reach its safe no-Finnhub fallback.
+  // Reject only malformed input; ticker metadata remains an optional display enhancement.
+  if (!/^[A-Z0-9][A-Z0-9.\-]{0,19}$/.test(symbol)) {
+    res.status(400).json({ error: "Invalid symbol provided" });
+    return;
   }
 
-  const companyName = STOCKS_METADATA[symbol].companyName;
-  const locale = typeof body?.locale === "string" && body.locale ? body.locale : "zh-TW";
-
-  if (!ai) {
-    console.log("GEMINI_API_KEY not configured. Simulating AI Analysis...");
-    return res.status(200).json(await getSimulatedAnalysis(symbol, companyName));
-  }
+  const companyName = STOCKS_METADATA[symbol]?.companyName ?? symbol;
+  const locale = typeof request.locale === "string" && request.locale ? request.locale : "zh-TW";
 
   let context: AnalysisContext;
   try {
-    context = await buildAnalysisContext(symbol, locale);
+    const quote = await fetchStockFromYahoo(symbol);
+    context = await buildAnalysisContext(quote, locale);
+    context.technicals = computeTechnicalIndicators(quote);
   } catch (error) {
-    console.error(`Failed to build analysis context for ${symbol}, falling back to offline analysis:`, error);
-    return res.status(200).json(await getSimulatedAnalysis(symbol, companyName));
+    console.error("Analysis context unavailable; returning null-safe fallback", error);
+    res.status(200).json(await getSimulatedAnalysis(symbol, companyName));
+    return;
   }
 
   const dataLimitations = buildDataLimitations(context);
+  if (!process.env.GEMINI_API_KEY) {
+    res.status(200).json(await getSimulatedAnalysis(symbol, companyName, context));
+    return;
+  }
 
   try {
-    console.log(`Analyzing ${symbol} with Gemini using real technical data...`);
-    const prompt = buildPrompt(context, dataLimitations);
-
-    const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash",
-      contents: prompt,
-      config: {
-        tools: [{ googleSearch: {} }],
-        responseMimeType: "application/json",
-        systemInstruction:
-          "You are an expert Wall Street financial analyst. You produce structured, professional stock analysis strictly grounded in the real numeric data supplied to you. You never fabricate pre[...]"
-      }
-    });
-
-    // Robust: log raw response and try multiple extraction paths before parsing JSON
-    console.log("Gemini raw response:", JSON.stringify(response, null, 2));
-    let responseText = "{}";
-    try {
-      if (typeof (response as any)?.text === "string" && (response as any).text.trim()) {
-        responseText = (response as any).text;
-      } else if (typeof (response as any)?.outputText === "string" && (response as any).outputText.trim()) {
-        responseText = (response as any).outputText;
-      } else if (Array.isArray((response as any)?.candidates) && (response as any).candidates[0]?.content) {
-        const c = (response as any).candidates[0].content;
-        if (typeof c === "string") {
-          responseText = c;
-        } else if (Array.isArray(c)) {
-          responseText = c.map((p: any) => (p?.text ? p.text : "")).join("");
-        } else {
-          responseText = JSON.stringify(c);
-        }
-      } else {
-        responseText = JSON.stringify(response);
-      }
-
-      let parsedData: any;
-      try {
-        parsedData = JSON.parse(responseText.trim());
-      } catch (parseErr) {
-        console.error("Failed to JSON.parse Gemini responseText:", responseText);
-        throw parseErr;
-      }
-
-      const groundingChunks = (response as any).candidates?.[0]?.groundingMetadata?.groundingChunks || [];
-      const sources = groundingChunks
-        .filter((chunk: any) => chunk.web?.uri)
-        .map((chunk: any) => ({
-          title: chunk.web.title || "Web Source",
-          uri: chunk.web.uri
-        }));
-
-      const result = shapeAnalysisResult(parsedData, context, dataLimitations, sources);
-      return res.status(200).json(result);
-    } catch (err) {
-      console.error("Gemini parse/extract error:", err);
-      throw err; // outer catch will handle fallback
-    }
-  } catch (error: any) {
-    console.error("Gemini API Error, falling back to offline analysis:", error);
-    const fallback = await getSimulatedAnalysis(symbol, companyName);
-    fallback.summary = `⚠️【系統提示：由於 Gemini API 調用次數達到限制，已自動為您加載本地預置深度分析報告】\n\n${fallback.summary}`;
-    return res.status(200).json(fallback);
+    const raw = await requestGemini(buildPrompt(context, dataLimitations), buildSystemInstruction(localeToLanguageInstruction(locale)));
+    res.status(200).json(shapeAnalysisResult(raw, context, dataLimitations));
+  } catch (error) {
+    console.error("Gemini analysis failed; returning null-safe fallback", error);
+    res.status(200).json(await getSimulatedAnalysis(symbol, companyName, context));
   }
 }
