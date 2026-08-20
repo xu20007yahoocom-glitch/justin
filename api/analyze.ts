@@ -346,7 +346,16 @@ async function callGemini(
   if (!response.ok) {
     const responsePreview = (await response.text()).slice(0, 600);
     console.warn("Gemini generateContent failed", { status: response.status, model, endpoint, responsePreview });
-    throw new GeminiHttpEfunction hasGenerateContentSupport(model: GeminiModelInfo): boolean {
+    throw new GeminiHttpError(response.status, model, endpoint, responsePreview);
+  }
+
+  const body = (await response.json()) as GeminiResponse;
+  const responseText = body.candidates?.[0]?.content?.parts?.map((part) => part.text ?? "").join("").trim();
+  if (!responseText) throw new Error("Gemini response contained no text");
+  return JSON.parse(responseText) as GeminiAnalysisDraft;
+}
+
+function hasGenerateContentSupport(model: GeminiModelInfo): boolean {
   const methods = [
     ...(Array.isArray(model.supportedGenerationMethods) ? model.supportedGenerationMethods : []),
     ...(Array.isArray(model.supportedActions) ? model.supportedActions : [])
@@ -448,15 +457,6 @@ async function resolveGeminiModel(apiKey: string, signal: AbortSignal): Promise<
     });
     return cacheGeminiModel(GEMINI_FALLBACK_MODEL, "fallback", GEMINI_FALLBACK_CACHE_TTL_MS);
   }
-}
-
-rror(response.status, model, endpoint, responsePreview);
-  }
-
-  const body = (await response.json()) as GeminiResponse;
-  const responseText = body.candidates?.[0]?.content?.parts?.map((part) => part.text ?? "").join("").trim();
-  if (!responseText) throw new Error("Gemini response contained no text");
-  return JSON.parse(responseText) as GeminiAnalysisDraft;
 }
 
 async function requestGemini(prompt: string, systemInstruction: string): Promise<GeminiAnalysisDraft> {
