@@ -16,12 +16,15 @@ import type {
 
 // Gemini 2.5 Flash is the stable default. An explicit environment override is useful
 // when a Google project exposes a different current model set.
-const GEMINI_MODEL = process.env.GEMINI_MODEL?.trim() || "gemini-flash-latest";
+// GEMINI_MODEL is only a safe fallback. The active model is chosen from models.list.
+const GEMINI_FALLBACK_MODEL = process.env.GEMINI_MODEL?.trim() || "gemini-flash-latest";
 const GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta";
 const GEMINI_TIMEOUT_MS = 25_000;
 const GEMINI_TRANSIENT_MAX_RETRIES = 3;
 const GEMINI_TRANSIENT_BASE_DELAY_MS = 1_000;
 const GEMINI_TRANSIENT_MAX_DELAY_MS = 4_000;
+const GEMINI_MODELS_CACHE_TTL_MS = 60 * 60 * 1_000;
+const GEMINI_FALLBACK_CACHE_TTL_MS = 5 * 60 * 1_000;
 
 function isTransientGeminiError(error: unknown): error is GeminiHttpError {
   if (!(error instanceof GeminiHttpError)) return false;
@@ -89,6 +92,14 @@ interface GeminiModelInfo {
 interface GeminiModelsListResponse {
   models?: GeminiModelInfo[];
 }
+
+interface CachedGeminiModel {
+  model: string;
+  source: "models.list" | "fallback";
+  expiresAt: number;
+}
+
+let geminiModelCache: CachedGeminiModel | null = null;
 
 interface GeminiAnalysisDraft {
   recommendation?: "BUY" | "HOLD" | "SELL" | "NEUTRAL";
@@ -335,7 +346,111 @@ async function callGemini(
   if (!response.ok) {
     const responsePreview = (await response.text()).slice(0, 600);
     console.warn("Gemini generateContent failed", { status: response.status, model, endpoint, responsePreview });
-    throw new GeminiHttpError(response.status, model, endpoint, responsePreview);
+    throw new GeminiHttpEfunction hasGenerateContentSupport(model: GeminiModelInfo): boolean {
+  const methods = [
+    ...(Array.isArray(model.supportedGenerationMethods) ? model.supportedGenerationMethods : []),
+    ...(Array.isArray(model.supportedActions) ? model.supportedActions : [])
+  ];
+  return methods.includes("generateContent");
+}
+
+function normalizeGeminiModelName(resourceName: string | undefined): string | null {
+  if (!resourceName) return null;
+  const model = resourceName.startsWith("models/")
+    ? resourceName.slice("models/".length)
+    : resourceName;
+  return model.startsWith("gemini-") ? model : null;
+}
+
+interface FlashModelCandidate {
+  model: string;
+  major: number;
+  minor: number;
+  patch: number;
+  isPreview: boolean;
+}
+
+function flashModelCandidate(model: string): FlashModelCandidate | null {
+  if (!model.startsWith("gemini-")) return null;
+  const flashIndex = model.indexOf("-flash");
+  if (flashIndex < 0) return null;
+  const excludedTerms = ["image", "live", "tts", "audio", "vision", "robotics"];
+  if (excludedTerms.some((term) => model.includes(term))) return null;
+  const versionText = model.slice("gemini-".length, flashIndex);
+  const versionParts = versionText.split(".");
+  if (versionParts.length === 0 || versionParts.length > 3) return null;
+  const numbers = versionParts.map((part) => Number(part));
+  if (numbers.some((value) => !Number.isInteger(value) || value < 0)) return null;
+  return {
+    model,
+    major: numbers[0],
+    minor: numbers[1] ?? 0,
+    patch: numbers[2] ?? 0,
+    isPreview: model.includes("preview")
+  };
+}
+
+function selectLatestFlashModel(models: GeminiModelInfo[]): string | null {
+  const compatible = models
+    .filter(hasGenerateContentSupport)
+    .map((model) => normalizeGeminiModelName(model.name))
+    .filter((model): model is string => model !== null);
+  const candidates = compatible
+    .map(flashModelCandidate)
+    .filter((candidate): candidate is FlashModelCandidate => candidate !== null)
+    .sort((left, right) => (
+      right.major - left.major ||
+      right.minor - left.minor ||
+      right.patch - left.patch ||
+      Number(left.isPreview) - Number(right.isPreview) ||
+      left.model.localeCompare(right.model)
+    ));
+  return candidates[0]?.model ?? compatible.find((model) => model === "gemini-flash-latest") ?? null;
+}
+
+function cacheGeminiModel(model: string, source: CachedGeminiModel["source"], ttlMs: number): CachedGeminiModel {
+  const cached = { model, source, expiresAt: Date.now() + ttlMs };
+  geminiModelCache = cached;
+  return cached;
+}
+
+async function resolveGeminiModel(apiKey: string, signal: AbortSignal): Promise<CachedGeminiModel> {
+  if (geminiModelCache && geminiModelCache.expiresAt > Date.now()) {
+    console.info("Gemini model selected", { model: geminiModelCache.model, source: geminiModelCache.source, cached: true });
+    return geminiModelCache;
+  }
+
+  const modelsUrl = new URL(`${GEMINI_BASE_URL}/models`);
+  modelsUrl.searchParams.set("key", apiKey);
+  const endpoint = modelsUrl.origin + modelsUrl.pathname;
+  try {
+    const response = await fetch(modelsUrl.toString(), { headers: { Accept: "application/json" }, signal });
+    if (!response.ok) {
+      const responsePreview = (await response.text()).slice(0, 600);
+      console.warn("Gemini models.list failed; using fallback model", { status: response.status, endpoint, responsePreview });
+      return cacheGeminiModel(GEMINI_FALLBACK_MODEL, "fallback", GEMINI_FALLBACK_CACHE_TTL_MS);
+    }
+
+    const body = (await response.json()) as GeminiModelsListResponse;
+    const selectedModel = selectLatestFlashModel(Array.isArray(body.models) ? body.models : []);
+    if (!selectedModel) {
+      console.warn("Gemini models.list returned no compatible Flash model; using fallback model", { endpoint });
+      return cacheGeminiModel(GEMINI_FALLBACK_MODEL, "fallback", GEMINI_FALLBACK_CACHE_TTL_MS);
+    }
+
+    const cached = cacheGeminiModel(selectedModel, "models.list", GEMINI_MODELS_CACHE_TTL_MS);
+    console.info("Gemini model selected", { model: cached.model, source: cached.source, cached: false });
+    return cached;
+  } catch (error) {
+    console.warn("Gemini models.list request failed; using fallback model", {
+      endpoint,
+      error: error instanceof Error ? error.message : String(error)
+    });
+    return cacheGeminiModel(GEMINI_FALLBACK_MODEL, "fallback", GEMINI_FALLBACK_CACHE_TTL_MS);
+  }
+}
+
+rror(response.status, model, endpoint, responsePreview);
   }
 
   const body = (await response.json()) as GeminiResponse;
@@ -350,13 +465,14 @@ async function requestGemini(prompt: string, systemInstruction: string): Promise
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
   try {
+    const resolvedModel = await resolveGeminiModel(apiKey, controller.signal);
     try {
-      return await callGeminiWithTransientRetries(GEMINI_MODEL, prompt, systemInstruction, apiKey, controller.signal);
+      return await callGeminiWithTransientRetries(resolvedModel.model, prompt, systemInstruction, apiKey, controller.signal);
     } catch (error) {
       if (!(error instanceof GeminiHttpError) || !isUnavailableModel404(error)) throw error;
       const suggestedModel = extractSuggestedModel(error.responsePreview);
-      if (!suggestedModel || suggestedModel === GEMINI_MODEL) throw error;
-      console.info("Retrying Gemini once with Google-suggested model", { previousModel: GEMINI_MODEL, suggestedModel });
+      if (!suggestedModel || suggestedModel === resolvedModel.model) throw error;
+      console.info("Retrying Gemini once with Google-suggested model", { previousModel: resolvedModel.model, suggestedModel });
       return await callGeminiWithTransientRetries(suggestedModel, prompt, systemInstruction, apiKey, controller.signal);
     }
   } finally {
