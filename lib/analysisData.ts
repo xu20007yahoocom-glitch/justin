@@ -9,6 +9,7 @@ import type {
   StockQuote,
   UnavailableReason
 } from "../src/types.js";
+import { getFmpIncomeStatement, type FmpIncomeStatementSnapshot, type FmpResult } from "./providers/fmp.js";
 import {
   detectMarketScope,
   getFinnhubFinancials,
@@ -213,6 +214,25 @@ function firstAvailableFinancialField(primary: SourcedField<number>, fallback: S
   return primary.value !== null ? primary : fallback;
 }
 
+function fmpIncomeField(
+  response: FmpResult<FmpIncomeStatementSnapshot> | null,
+  field: "revenue" | "netIncome",
+  unavailableReason: UnavailableReason
+): SourcedField<number> {
+  const snapshot = response?.data ?? null;
+  const value = snapshot?.[field] ?? null;
+  return apiField(
+    value,
+    "FMP Income Statement（年報／可能延遲）",
+    "/income-statement?symbol=&limit=1&period=annual",
+    field,
+    response?.fetchedAt ?? null,
+    snapshot?.periodEnd ?? null,
+    response?.isStale ?? false,
+    unavailableReason
+  );
+}
+
 function uniqueNonOverlappingBusinesses(
   response: FinnhubResult<FinnhubRevenueBreakdownResponse> | null,
   reason: UnavailableReason
@@ -328,17 +348,25 @@ function buildFinancialMetrics(
   metric: FinnhubResult<FinnhubMetricResponse> | null,
   reported: FinnhubResult<FinnhubFinancialsReportedResponse> | null,
   standardFinancials: FinnhubResult<FinnhubFinancialsResponse> | null,
+  fmpIncome: FmpResult<FmpIncomeStatementSnapshot> | null,
   reason: UnavailableReason
 ): FinancialMetricSet {
   const revenueKeys = ["Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax", "SalesRevenueNet", "Revenue", "TotalRevenue"];
   const netIncomeKeys = ["NetIncomeLoss", "ProfitLoss", "NetIncome", "NetIncomeAvailableToCommonStockholders"];
+  const fmpReason: UnavailableReason = process.env.FMP_API_KEY ? "FMP 回傳無此欄位" : "FMP_API_KEY 未設定";
   const revenue = firstAvailableFinancialField(
-    reportedIncomeField(reported, revenueKeys, reason),
-    standardIncomeField(standardFinancials, revenueKeys, reason)
+    firstAvailableFinancialField(
+      reportedIncomeField(reported, revenueKeys, reason),
+      standardIncomeField(standardFinancials, revenueKeys, reason)
+    ),
+    fmpIncomeField(fmpIncome, "revenue", fmpReason)
   );
   const netIncome = firstAvailableFinancialField(
-    reportedIncomeField(reported, netIncomeKeys, reason),
-    standardIncomeField(standardFinancials, netIncomeKeys, reason)
+    firstAvailableFinancialField(
+      reportedIncomeField(reported, netIncomeKeys, reason),
+      standardIncomeField(standardFinancials, netIncomeKeys, reason)
+    ),
+    fmpIncomeField(fmpIncome, "netIncome", fmpReason)
   );
 
   return {
@@ -377,6 +405,7 @@ export async function buildAnalysisContext(
         getFinnhubMetric(quote.symbol),
         getFinnhubFinancialsReported(quote.symbol, "annual"),
         getFinnhubFinancials(quote.symbol, "annual"),
+        getFmpIncomeStatement(quote.symbol),
         getFinnhubRevenueBreakdown(quote.symbol)
       ])
     : null;
@@ -385,8 +414,9 @@ export async function buildAnalysisContext(
   const metric = (settled?.[1]?.status === "fulfilled" ? settled[1].value : null) as FinnhubResult<FinnhubMetricResponse> | null;
   const reported = (settled?.[2]?.status === "fulfilled" ? settled[2].value : null) as FinnhubResult<FinnhubFinancialsReportedResponse> | null;
   const standardFinancials = (settled?.[3]?.status === "fulfilled" ? settled[3].value : null) as FinnhubResult<FinnhubFinancialsResponse> | null;
-  const revenue = (settled?.[4]?.status === "fulfilled" ? settled[4].value : null) as FinnhubResult<FinnhubRevenueBreakdownResponse> | null;
-  const metrics = buildFinancialMetrics(metric, reported, standardFinancials, reason);
+  const fmpIncome = (settled?.[4]?.status === "fulfilled" ? settled[4].value : null) as FmpResult<FmpIncomeStatementSnapshot> | null;
+  const revenue = (settled?.[5]?.status === "fulfilled" ? settled[5].value : null) as FinnhubResult<FinnhubRevenueBreakdownResponse> | null;
+  const metrics = buildFinancialMetrics(metric, reported, standardFinancials, fmpIncome, reason);
   console.info("Finnhub financial mapping", {
     symbol: quote.symbol,
     revenueAvailable: metrics.revenue.value !== null,
