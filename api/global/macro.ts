@@ -1,306 +1,270 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
-import type { GlobalMacroReference, GlobalMacroSection, GlobalMacroSource } from "../../src/types.js";
+import { getEiaInternationalLatest, type EiaInternationalObservation, type EiaResult } from "../../lib/providers/eia.js";
+import { getFredLatestObservation, type FredLatestObservation, type FredResult } from "../../lib/providers/fred.js";
+import { getGdeltRecentArticles, type GdeltArticle, type GdeltResult } from "../../lib/providers/gdelt.js";
+import type {
+  GlobalMacroItem,
+  GlobalMacroProvider,
+  GlobalMacroReference,
+  GlobalMacroSection,
+  GlobalMacroSource
+} from "../../src/types.js";
 
-const GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta";
 const MACRO_CACHE_TTL_MS = 30 * 60 * 1_000;
-const MACRO_TIMEOUT_MS = 25_000;
-const MAX_MODEL_ATTEMPTS = 3;
-const DATA_NATURE = "AI 聯網搜尋整理，非即時行情，僅供參考" as const;
-const UNAVAILABLE_TEXT = "暫無可靠資料";
-
-interface GeminiModelInfo {
-  name?: string;
-  supportedGenerationMethods?: string[];
-  supportedActions?: string[];
-}
-
-interface GeminiModelsListResponse {
-  models?: GeminiModelInfo[];
-}
-
-interface GeminiGroundingChunk {
-  web?: { uri?: string; title?: string };
-}
-
-interface GeminiGroundingMetadata {
-  groundingChunks?: GeminiGroundingChunk[];
-  webSearchQueries?: string[];
-}
-
-interface GeminiCandidate {
-  content?: { parts?: Array<{ text?: string }> };
-  groundingMetadata?: GeminiGroundingMetadata;
-}
-
-interface GeminiResponse {
-  candidates?: GeminiCandidate[];
-}
-
-interface MacroDraft {
-  criticalMinerals?: string;
-  energyCommodities?: string;
-  preciousMetals?: string;
-  geopolitics?: string;
-  countryNews?: string;
-}
+const DATA_NATURE = "真实数据整理，非实时，定期更新" as const;
+const UNAVAILABLE_TEXT = "暂无可靠资料";
+const EIA_INTERNATIONAL_URL = "https://www.eia.gov/international/data/world/";
+const FRED_LMBA_REMOVAL_URL = "https://fred.stlouisfed.org/series/GOLDAMGBD228NLBM";
 
 interface CachedMacro {
   value: GlobalMacroReference;
   expiresAt: number;
 }
 
-interface GroundingAttempt {
-  value: GlobalMacroReference | null;
-  reason: string | null;
-}
-
 let macroCache: CachedMacro | null = null;
 
-function section(title: string, summary = UNAVAILABLE_TEXT, sources: GlobalMacroSource[] = []): GlobalMacroSection {
-  return { title, summary, sources };
+function dedupeSources(sources: Array<GlobalMacroSource | null>): GlobalMacroSource[] {
+  const seen = new Set<string>();
+  return sources.flatMap((source) => {
+    if (!source) return [];
+    const key = `${source.provider}:${source.url}:${source.dataTime ?? ""}`;
+    if (seen.has(key)) return [];
+    seen.add(key);
+    return [source];
+  });
+}
+
+function section(title: string, items: GlobalMacroItem[], summary?: string): GlobalMacroSection {
+  const sources = dedupeSources(items.map((item) => item.source));
+  const availableItems = items.filter((item) => item.available);
+  const updatedAt = availableItems
+    .map((item) => item.dataTime)
+    .filter((value): value is string => Boolean(value))
+    .sort()
+    .at(-1) ?? null;
+  return {
+    title,
+    summary: summary ?? (availableItems.length > 0 ? "真实来源数据；非实时，定期更新" : UNAVAILABLE_TEXT),
+    updatedAt,
+    items,
+    sources
+  };
+}
+
+function unavailableItem(
+  label: string,
+  provider: GlobalMacroProvider,
+  title: string,
+  url: string,
+  note: string
+): GlobalMacroItem {
+  return {
+    label,
+    value: UNAVAILABLE_TEXT,
+    unit: null,
+    dataTime: null,
+    source: { provider, title, url, dataTime: null },
+    note,
+    available: false
+  };
+}
+
+function fredItem(
+  label: string,
+  observation: FredResult<FredLatestObservation> | null,
+  unit: string,
+  seriesTitle: string
+): GlobalMacroItem {
+  const seriesId = observation?.data.seriesId;
+  const url = seriesId ? `https://fred.stlouisfed.org/series/${encodeURIComponent(seriesId)}` : "https://fred.stlouisfed.org/docs/api/fred/series_observations.html";
+  if (!observation) {
+    return unavailableItem(label, "FRED", seriesTitle, url, "FRED 无可验证观测值或 FRED_API_KEY 未配置；非实时，定期更新");
+  }
+  return {
+    label,
+    value: observation.data.value,
+    unit,
+    dataTime: observation.data.observationDate,
+    source: {
+      provider: "FRED",
+      title: `${seriesTitle}（${observation.data.seriesId}）`,
+      url,
+      dataTime: observation.data.observationDate
+    },
+    note: `${observation.isStale ? "服务端缓存可能过期；" : ""}非实时，定期更新`,
+    available: true
+  };
+}
+
+function eiaItem(label: string, result: EiaResult<EiaInternationalObservation> | null): GlobalMacroItem {
+  if (!result) {
+    return unavailableItem(label, "EIA", "EIA International", EIA_INTERNATIONAL_URL, "EIA 无可验证观测值或 EIA_API_KEY 未配置；非实时，定期更新");
+  }
+  const data = result.data;
+  const title = data.countryRegionName && data.productName && data.activityName
+    ? `EIA International：${data.countryRegionName} ${data.productName} ${data.activityName}`
+    : "EIA International";
+  return {
+    label,
+    value: data.value,
+    unit: data.unitName ?? data.unit,
+    dataTime: data.period,
+    source: {
+      provider: "EIA",
+      title,
+      url: EIA_INTERNATIONAL_URL,
+      dataTime: data.period
+    },
+    note: `${result.isStale ? "服务端缓存可能过期；" : ""}${data.frequency ?? "annual"} 数据；非实时，定期更新`,
+    available: true
+  };
+}
+
+function gdeltItems(label: string, result: GdeltResult<GdeltArticle[]> | null): GlobalMacroItem[] {
+  if (!result) {
+    return [unavailableItem(label, "GDELT", "GDELT DOC 2.0", "https://api.gdeltproject.org/api/v2/doc/doc", "GDELT 未返回可验证新闻；非实时，定期更新")];
+  }
+  return result.data.map((article) => ({
+    label: article.title,
+    value: article.domain ? `新闻来源：${article.domain}` : "新闻来源链接可用",
+    unit: null,
+    dataTime: article.seenAt,
+    source: {
+      provider: "GDELT",
+      title: article.title,
+      url: article.url,
+      dataTime: article.seenAt
+    },
+    note: `${result.isStale ? "服务端缓存可能过期；" : ""}GDELT 新闻索引，非实时，定期更新`,
+    available: true
+  }));
 }
 
 function unavailable(reason: string): GlobalMacroReference {
+  const preciousMetals = section("贵金属", [
+    unavailableItem("黄金现货价", "FRED", "FRED：LMBA Gold Price 日度数据已移除", FRED_LMBA_REMOVAL_URL, "未使用已移除的 FRED LMBA 金价 series；非实时，定期更新")
+  ]);
+  const energyPrices = section("能源价格", [
+    unavailableItem("WTI 原油", "FRED", "FRED：WTI Cushing Spot Price", "https://fred.stlouisfed.org/series/DCOILWTICO", "非实时，定期更新"),
+    unavailableItem("Brent 原油", "FRED", "FRED：Global price of Brent Crude", "https://fred.stlouisfed.org/series/POILBREUSDM", "非实时，定期更新"),
+    unavailableItem("Henry Hub 天然气", "FRED", "FRED：Henry Hub Natural Gas Spot Price", "https://fred.stlouisfed.org/series/DHHNGSP", "非实时，定期更新")
+  ]);
+  const countryEnergy = section("各国储备／使用量", [
+    unavailableItem("中国石油及其他液体消费", "EIA", "EIA International", EIA_INTERNATIONAL_URL, "非实时，定期更新"),
+    unavailableItem("美国石油及其他液体消费", "EIA", "EIA International", EIA_INTERNATIONAL_URL, "非实时，定期更新"),
+    unavailableItem("中国石油储备", "EIA", "EIA International", EIA_INTERNATIONAL_URL, "EIA International 未验证支持此指标；非实时，定期更新")
+  ]);
+  const centralBankRates = section("央行利率", [
+    unavailableItem("美国有效联邦基金利率", "FRED", "FRED：Federal Funds Effective Rate", "https://fred.stlouisfed.org/series/DFF", "非实时，定期更新"),
+    unavailableItem("美国联邦基金目标区间上限", "FRED", "FRED：Federal Funds Target Range - Upper Limit", "https://fred.stlouisfed.org/series/DFEDTARU", "非实时，定期更新"),
+    unavailableItem("欧元区 ECB 存款便利利率", "FRED", "FRED：ECB Deposit Facility Rate", "https://fred.stlouisfed.org/series/ECBDFR", "非实时，定期更新")
+  ]);
+  const geopoliticalNews = section("地缘政治／全球新闻", [
+    unavailableItem("近期地缘政治与全球新闻", "GDELT", "GDELT DOC 2.0", "https://api.gdeltproject.org/api/v2/doc/doc", "非实时，定期更新")
+  ]);
+
   return {
     available: false,
     dataNature: DATA_NATURE,
     generatedAt: new Date().toISOString(),
     cachedAt: null,
     isStale: false,
-    model: null,
-    searchQueries: [],
-    sources: [],
-    criticalMinerals: section("關鍵礦產（鋰、鈷、稀土）"),
-    energyCommodities: section("能源商品（原油、天然氣）"),
-    preciousMetals: section("黃金／貴金屬"),
-    geopolitics: section("重大地緣政治動態與世界格局"),
-    countryNews: section("各國重大新聞摘要"),
+    sources: dedupeSources([
+      ...preciousMetals.sources,
+      ...energyPrices.sources,
+      ...countryEnergy.sources,
+      ...centralBankRates.sources,
+      ...geopoliticalNews.sources
+    ]),
+    preciousMetals,
+    energyPrices,
+    countryEnergy,
+    centralBankRates,
+    geopoliticalNews,
     unavailableReason: reason
   };
 }
 
-function text(value: unknown, limit = 1_200): string {
-  return typeof value === "string" ? value.trim().slice(0, limit) : "";
-}
-
-function unwrapJson(input: string): string {
-  const trimmed = input.trim();
-  const fenced = trimmed.match(/^```(?:json)?\s*\r?\n?([\s\S]*?)\s*```$/i);
-  return (fenced?.[1] ?? trimmed).trim();
-}
-
-function hasGenerateContentSupport(model: GeminiModelInfo): boolean {
-  const methods = [
-    ...(Array.isArray(model.supportedGenerationMethods) ? model.supportedGenerationMethods : []),
-    ...(Array.isArray(model.supportedActions) ? model.supportedActions : [])
-  ];
-  return methods.includes("generateContent");
-}
-
-function normalizeModelName(name: string | undefined): string | null {
-  if (!name) return null;
-  const value = name.startsWith("models/") ? name.slice("models/".length) : name;
-  return value.startsWith("gemini-") ? value : null;
-}
-
-function isSearchCandidate(model: string): boolean {
-  const lower = model.toLowerCase();
-  return lower.includes("gemini")
-    && lower.includes("flash")
-    && !["image", "live", "tts", "audio", "robotics"].some((term) => lower.includes(term));
-}
-
-function modelVersion(model: string): [number, number, number] {
-  const match = model.match(/gemini-(\d+)(?:\.(\d+))?(?:\.(\d+))?-flash/);
-  return match ? [Number(match[1]), Number(match[2] ?? 0), Number(match[3] ?? 0)] : [0, 0, 0];
-}
-
-/**
- * Google Search Grounding can be plan- and model-specific. Prefer regular
- * non-3.x Flash candidates first, then 3.x, and finally non-versioned aliases.
- * This avoids choosing a 3.x model first where its grounding entitlement is absent.
- */
-function compareMacroCandidates(left: string, right: string): number {
-  const [leftMajor, leftMinor, leftPatch] = modelVersion(left);
-  const [rightMajor, rightMinor, rightPatch] = modelVersion(right);
-  const leftLower = left.toLowerCase();
-  const rightLower = right.toLowerCase();
-  const leftTier = leftMajor > 0 && leftMajor < 3 ? 0 : leftMajor >= 3 ? 1 : 2;
-  const rightTier = rightMajor > 0 && rightMajor < 3 ? 0 : rightMajor >= 3 ? 1 : 2;
-  const leftLite = leftLower.includes("lite") ? 1 : 0;
-  const rightLite = rightLower.includes("lite") ? 1 : 0;
-  const leftAlias = leftLower.includes("latest") ? 1 : 0;
-  const rightAlias = rightLower.includes("latest") ? 1 : 0;
-
-  return leftTier - rightTier
-    || leftLite - rightLite
-    || rightMajor - leftMajor
-    || rightMinor - leftMinor
-    || rightPatch - leftPatch
-    || leftAlias - rightAlias
-    || left.localeCompare(right);
-}
-
-function selectMacroModels(models: GeminiModelInfo[]): string[] {
-  const unique = new Set<string>();
-  for (const item of models) {
-    const model = normalizeModelName(item.name);
-    if (model && hasGenerateContentSupport(item) && isSearchCandidate(model)) unique.add(model);
-  }
-  return [...unique].sort(compareMacroCandidates).slice(0, MAX_MODEL_ATTEMPTS);
-}
-
-function toSources(metadata: GeminiGroundingMetadata | undefined): GlobalMacroSource[] {
-  const seen = new Set<string>();
-  const chunks = Array.isArray(metadata?.groundingChunks) ? metadata.groundingChunks : [];
-  return chunks.flatMap((chunk) => {
-    const url = text(chunk.web?.uri, 2_000);
-    if (!url || seen.has(url)) return [];
-    seen.add(url);
-    return [{ title: text(chunk.web?.title, 200) || url, url }];
-  });
-}
-
-async function resolveMacroModels(apiKey: string, signal: AbortSignal): Promise<string[]> {
-  const modelsUrl = new URL(`${GEMINI_BASE_URL}/models`);
-  modelsUrl.searchParams.set("key", apiKey);
-  const response = await fetch(modelsUrl.toString(), { headers: { Accept: "application/json" }, signal });
-  if (!response.ok) {
-    console.warn("Macro models.list failed", { status: response.status, endpoint: modelsUrl.origin + modelsUrl.pathname });
-    return [];
-  }
-  const body = await response.json() as GeminiModelsListResponse;
-  const models = selectMacroModels(Array.isArray(body.models) ? body.models : []);
-  console.info("Global macro model candidates", { models });
-  return models;
-}
-
-function systemInstruction(): string {
-  return "你是全球宏觀參考整理器。必須使用 Google Search tool 取得近期公開資訊。所有輸出使用繁體中文，禁止捏造精確價格、報價、百分比、日期或事件。只在來源可支持時說明趨勢；否則寫『暫無可靠資料』。只輸出一個合法 JSON 物件，不使用 Markdown 或程式碼區塊。";
-}
-
-function prompt(): string {
-  return `請搜尋並整理下列全球宏觀主題。每一項都只能提供定性趨勢與已搜尋到的公開資訊；不得創造精確價格或未支持的事實。輸出 JSON：
-{
-  "criticalMinerals": "鋰、鈷、稀土的近期供需／價格趨勢定性整理，或暫無可靠資料",
-  "energyCommodities": "原油、天然氣的近期價格趨勢定性整理，或暫無可靠資料",
-  "preciousMetals": "黃金與其他重要貴金屬的近期趨勢定性整理，或暫無可靠資料",
-  "geopolitics": "重大地緣政治動態與世界格局的定性整理，或暫無可靠資料",
-  "countryNews": "各國重大新聞摘要，或暫無可靠資料"
-}`;
-}
-
-async function attemptGroundedMacro(apiKey: string, model: string, signal: AbortSignal): Promise<GroundingAttempt> {
-  const endpointUrl = new URL(`${GEMINI_BASE_URL}/models/${encodeURIComponent(model)}:generateContent`);
-  endpointUrl.searchParams.set("key", apiKey);
-  const endpoint = endpointUrl.origin + endpointUrl.pathname;
-
-  try {
-    const response = await fetch(endpointUrl.toString(), {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Accept: "application/json" },
-      signal,
-      body: JSON.stringify({
-        systemInstruction: { parts: [{ text: systemInstruction() }] },
-        contents: [{ role: "user", parts: [{ text: prompt() }] }],
-        tools: [{ googleSearch: {} }],
-        generationConfig: { temperature: 0.1, responseMimeType: "application/json" }
-      })
-    });
-
-    if (!response.ok) {
-      const responsePreview = (await response.text()).slice(0, 800);
-      const reason = `HTTP ${response.status}`;
-      console.warn("Global macro Gemini grounding candidate failed", { status: response.status, model, endpoint, responsePreview, nextAttempt: true });
-      return { value: null, reason };
-    }
-
-    const body = await response.json() as GeminiResponse;
-    const candidate = body.candidates?.[0];
-    const rawText = candidate?.content?.parts?.map((part) => part.text ?? "").join("").trim() ?? "";
-    const metadata = candidate?.groundingMetadata;
-    const sources = toSources(metadata);
-    const queries = Array.isArray(metadata?.webSearchQueries)
-      ? metadata.webSearchQueries.map((query) => text(query, 300)).filter(Boolean).slice(0, 12)
-      : [];
-
-    console.info("Global macro Gemini grounding response", {
-      model,
-      endpoint,
-      rawTextSample: rawText.slice(0, 2_000),
-      sourceCount: sources.length,
-      searchQueries: queries
-    });
-
-    if (!rawText) return { value: null, reason: "未回傳可用內容" };
-    if (sources.length === 0 && queries.length === 0) return { value: null, reason: "未提供可驗證的搜尋來源" };
-
-    let draft: MacroDraft;
-    try {
-      draft = JSON.parse(unwrapJson(rawText)) as MacroDraft;
-    } catch (error) {
-      console.error("Global macro JSON parse failed", {
-        model,
-        reason: error instanceof Error ? error.message : String(error),
-        rawText
-      });
-      return { value: null, reason: "回應格式無法驗證" };
-    }
-
-    const generatedAt = new Date().toISOString();
-    return {
-      value: {
-        available: true,
-        dataNature: DATA_NATURE,
-        generatedAt,
-        cachedAt: generatedAt,
-        isStale: false,
-        model,
-        searchQueries: queries,
-        sources,
-        criticalMinerals: section("關鍵礦產（鋰、鈷、稀土）", text(draft.criticalMinerals) || UNAVAILABLE_TEXT, sources),
-        energyCommodities: section("能源商品（原油、天然氣）", text(draft.energyCommodities) || UNAVAILABLE_TEXT, sources),
-        preciousMetals: section("黃金／貴金屬", text(draft.preciousMetals) || UNAVAILABLE_TEXT, sources),
-        geopolitics: section("重大地緣政治動態與世界格局", text(draft.geopolitics) || UNAVAILABLE_TEXT, sources),
-        countryNews: section("各國重大新聞摘要", text(draft.countryNews) || UNAVAILABLE_TEXT, sources),
-        unavailableReason: null
-      },
-      reason: null
-    };
-  } catch (error) {
-    const reason = error instanceof Error ? error.message : String(error);
-    console.warn("Global macro Gemini grounding candidate threw", { model, endpoint, reason, nextAttempt: true });
-    return { value: null, reason };
-  }
-}
-
 async function generateMacro(): Promise<GlobalMacroReference> {
-  const apiKey = process.env.GEMINI_API_KEY?.trim();
-  if (!apiKey) return unavailable("GEMINI_API_KEY 未設定，無法執行聯網搜尋");
-
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), MACRO_TIMEOUT_MS);
   try {
-    const models = await resolveMacroModels(apiKey, controller.signal);
-    if (models.length === 0) return unavailable("未找到可用的 Google Search Grounding Flash model");
+    const [wti, brent, henryHub, fedFunds, fedTargetUpper, ecbDeposit, chinaConsumption, usConsumption, geopolitical, energyNews] = await Promise.all([
+      getFredLatestObservation("DCOILWTICO"),
+      getFredLatestObservation("POILBREUSDM"),
+      getFredLatestObservation("DHHNGSP"),
+      getFredLatestObservation("DFF"),
+      getFredLatestObservation("DFEDTARU"),
+      getFredLatestObservation("ECBDFR"),
+      getEiaInternationalLatest({ activityId: "2", productId: "5", countryRegionId: "CHN", unit: "TBPD" }),
+      getEiaInternationalLatest({ activityId: "2", productId: "5", countryRegionId: "USA", unit: "TBPD" }),
+      getGdeltRecentArticles("geopolitics"),
+      getGdeltRecentArticles("energy")
+    ]);
 
-    const reasons: string[] = [];
-    for (const model of models) {
-      const attempt = await attemptGroundedMacro(apiKey, model, controller.signal);
-      if (attempt.value) {
-        macroCache = { value: attempt.value, expiresAt: Date.now() + MACRO_CACHE_TTL_MS };
-        return attempt.value;
-      }
-      if (attempt.reason) reasons.push(`${model}: ${attempt.reason}`);
-    }
+    // FRED removed the LMBA Gold Price daily series. This item intentionally remains unavailable rather than substituting an estimate.
+    const preciousMetals = section("贵金属", [
+      unavailableItem("黄金现货价", "FRED", "FRED：LMBA Gold Price 日度数据已移除", FRED_LMBA_REMOVAL_URL, "FRED 当前未提供本端点可验证的黄金现货 series；非实时，定期更新")
+    ], "黄金现货未取得可验证 FRED 观测值，显示暂无可靠资料");
 
-    console.warn("Global macro all grounding candidates failed", { models, reasons });
-    return unavailable("Google Search Grounding 暫時不可用，已嘗試可用 Flash 候選模型");
+    const energyPrices = section("能源价格", [
+      fredItem("WTI 原油", wti, "美元／桶", "WTI Cushing Spot Price"),
+      fredItem("Brent 原油", brent, "美元／桶", "Global price of Brent Crude"),
+      fredItem("Henry Hub 天然气", henryHub, "美元／百万 Btu", "Henry Hub Natural Gas Spot Price")
+    ]);
+
+    const countryEnergy = section("各国储备／使用量", [
+      eiaItem("中国石油及其他液体消费", chinaConsumption),
+      eiaItem("美国石油及其他液体消费", usConsumption),
+      unavailableItem("中国石油储备", "EIA", "EIA International", EIA_INTERNATIONAL_URL, "EIA International 未验证支持中国石油储备指标；非实时，定期更新")
+    ], "EIA International 年度数据；储备缺失时显示暂无可靠资料");
+
+    const centralBankRates = section("央行利率", [
+      fredItem("美国有效联邦基金利率", fedFunds, "百分比", "Federal Funds Effective Rate"),
+      fredItem("美国联邦基金目标区间上限", fedTargetUpper, "百分比", "Federal Funds Target Range - Upper Limit"),
+      fredItem("欧元区 ECB 存款便利利率", ecbDeposit, "百分比", "ECB Deposit Facility Rate for Euro Area")
+    ]);
+
+    const geopoliticalItems = [
+      ...gdeltItems("地缘政治新闻", geopolitical),
+      ...gdeltItems("能源相关新闻", energyNews)
+    ];
+    const geopoliticalNews = section("地缘政治／全球新闻", geopoliticalItems, "GDELT 新闻索引；仅展示来源文章元数据，非实时，定期更新");
+
+    const sources = dedupeSources([
+      ...preciousMetals.sources,
+      ...energyPrices.sources,
+      ...countryEnergy.sources,
+      ...centralBankRates.sources,
+      ...geopoliticalNews.sources
+    ]);
+    const anyStale = [wti, brent, henryHub, fedFunds, fedTargetUpper, ecbDeposit, chinaConsumption, usConsumption, geopolitical, energyNews]
+      .some((result) => result?.isStale === true);
+    const available = [
+      ...preciousMetals.items,
+      ...energyPrices.items,
+      ...countryEnergy.items,
+      ...centralBankRates.items,
+      ...geopoliticalNews.items
+    ].some((item) => item.available);
+
+    const value: GlobalMacroReference = {
+      available,
+      dataNature: DATA_NATURE,
+      generatedAt: new Date().toISOString(),
+      cachedAt: new Date().toISOString(),
+      isStale: anyStale,
+      sources,
+      preciousMetals,
+      energyPrices,
+      countryEnergy,
+      centralBankRates,
+      geopoliticalNews,
+      unavailableReason: available ? null : "所有数据源暂时不可用或未配置相应密钥"
+    };
+    macroCache = { value, expiresAt: Date.now() + MACRO_CACHE_TTL_MS };
+    return value;
   } catch (error) {
-    console.error("Global macro request failed; returning null-safe fallback", error instanceof Error ? error.message : String(error));
-    return unavailable("全球宏觀搜尋暫時不可用，請稍後再試");
-  } finally {
-    clearTimeout(timeout);
+    console.error("Global macro real-data assembly failed; returning null-safe fallback", error instanceof Error ? error.message : String(error));
+    return unavailable("全球宏观数据暂时不可用，请稍后再试");
   }
 }
 
@@ -310,14 +274,20 @@ export default async function handler(req: VercelRequest, res: VercelResponse): 
     return;
   }
 
-  if (macroCache && macroCache.expiresAt > Date.now()) {
-    const value = { ...macroCache.value, cachedAt: macroCache.value.generatedAt, isStale: false };
+  try {
+    if (macroCache && macroCache.expiresAt > Date.now()) {
+      const cached = { ...macroCache.value, cachedAt: macroCache.value.generatedAt };
+      res.setHeader("Cache-Control", "s-maxage=1800, stale-while-revalidate=3600");
+      res.status(200).json(cached);
+      return;
+    }
+
+    const value = await generateMacro();
     res.setHeader("Cache-Control", "s-maxage=1800, stale-while-revalidate=3600");
     res.status(200).json(value);
-    return;
+  } catch (error) {
+    console.error("Global macro handler failed; returning null-safe fallback", error instanceof Error ? error.message : String(error));
+    res.setHeader("Cache-Control", "no-store");
+    res.status(200).json(unavailable("全球宏观数据暂时不可用，请稍后再试"));
   }
-
-  const value = await generateMacro();
-  res.setHeader("Cache-Control", "s-maxage=1800, stale-while-revalidate=3600");
-  res.status(200).json(value);
 }
