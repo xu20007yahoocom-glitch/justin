@@ -4,6 +4,7 @@ import type { GlobalMacroReference, GlobalMacroSection, GlobalMacroSource } from
 const GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta";
 const MACRO_CACHE_TTL_MS = 30 * 60 * 1_000;
 const MACRO_TIMEOUT_MS = 25_000;
+const MAX_MODEL_ATTEMPTS = 3;
 const DATA_NATURE = "AI 聯網搜尋整理，非即時行情，僅供參考" as const;
 const UNAVAILABLE_TEXT = "暫無可靠資料";
 
@@ -46,6 +47,11 @@ interface MacroDraft {
 interface CachedMacro {
   value: GlobalMacroReference;
   expiresAt: number;
+}
+
+interface GroundingAttempt {
+  value: GlobalMacroReference | null;
+  reason: string | null;
 }
 
 let macroCache: CachedMacro | null = null;
@@ -97,7 +103,7 @@ function normalizeModelName(name: string | undefined): string | null {
   return value.startsWith("gemini-") ? value : null;
 }
 
-function isSearchCapableFlash(model: string): boolean {
+function isSearchCandidate(model: string): boolean {
   const lower = model.toLowerCase();
   return lower.includes("gemini")
     && lower.includes("flash")
@@ -109,17 +115,39 @@ function modelVersion(model: string): [number, number, number] {
   return match ? [Number(match[1]), Number(match[2] ?? 0), Number(match[3] ?? 0)] : [0, 0, 0];
 }
 
-function selectMacroModel(models: GeminiModelInfo[]): string | null {
-  const candidates = models
-    .filter(hasGenerateContentSupport)
-    .map((item) => normalizeModelName(item.name))
-    .filter((model): model is string => Boolean(model && isSearchCapableFlash(model)))
-    .sort((left, right) => {
-      const [leftMajor, leftMinor, leftPatch] = modelVersion(left);
-      const [rightMajor, rightMinor, rightPatch] = modelVersion(right);
-      return rightMajor - leftMajor || rightMinor - leftMinor || rightPatch - leftPatch || left.localeCompare(right);
-    });
-  return candidates[0] ?? null;
+/**
+ * Google Search Grounding can be plan- and model-specific. Prefer regular
+ * non-3.x Flash candidates first, then 3.x, and finally non-versioned aliases.
+ * This avoids choosing a 3.x model first where its grounding entitlement is absent.
+ */
+function compareMacroCandidates(left: string, right: string): number {
+  const [leftMajor, leftMinor, leftPatch] = modelVersion(left);
+  const [rightMajor, rightMinor, rightPatch] = modelVersion(right);
+  const leftLower = left.toLowerCase();
+  const rightLower = right.toLowerCase();
+  const leftTier = leftMajor > 0 && leftMajor < 3 ? 0 : leftMajor >= 3 ? 1 : 2;
+  const rightTier = rightMajor > 0 && rightMajor < 3 ? 0 : rightMajor >= 3 ? 1 : 2;
+  const leftLite = leftLower.includes("lite") ? 1 : 0;
+  const rightLite = rightLower.includes("lite") ? 1 : 0;
+  const leftAlias = leftLower.includes("latest") ? 1 : 0;
+  const rightAlias = rightLower.includes("latest") ? 1 : 0;
+
+  return leftTier - rightTier
+    || leftLite - rightLite
+    || rightMajor - leftMajor
+    || rightMinor - leftMinor
+    || rightPatch - leftPatch
+    || leftAlias - rightAlias
+    || left.localeCompare(right);
+}
+
+function selectMacroModels(models: GeminiModelInfo[]): string[] {
+  const unique = new Set<string>();
+  for (const item of models) {
+    const model = normalizeModelName(item.name);
+    if (model && hasGenerateContentSupport(item) && isSearchCandidate(model)) unique.add(model);
+  }
+  return [...unique].sort(compareMacroCandidates).slice(0, MAX_MODEL_ATTEMPTS);
 }
 
 function toSources(metadata: GeminiGroundingMetadata | undefined): GlobalMacroSource[] {
@@ -133,16 +161,18 @@ function toSources(metadata: GeminiGroundingMetadata | undefined): GlobalMacroSo
   });
 }
 
-async function resolveMacroModel(apiKey: string, signal: AbortSignal): Promise<string | null> {
+async function resolveMacroModels(apiKey: string, signal: AbortSignal): Promise<string[]> {
   const modelsUrl = new URL(`${GEMINI_BASE_URL}/models`);
   modelsUrl.searchParams.set("key", apiKey);
   const response = await fetch(modelsUrl.toString(), { headers: { Accept: "application/json" }, signal });
   if (!response.ok) {
     console.warn("Macro models.list failed", { status: response.status, endpoint: modelsUrl.origin + modelsUrl.pathname });
-    return null;
+    return [];
   }
   const body = await response.json() as GeminiModelsListResponse;
-  return selectMacroModel(Array.isArray(body.models) ? body.models : []);
+  const models = selectMacroModels(Array.isArray(body.models) ? body.models : []);
+  console.info("Global macro model candidates", { models });
+  return models;
 }
 
 function systemInstruction(): string {
@@ -160,22 +190,16 @@ function prompt(): string {
 }`;
 }
 
-async function generateMacro(): Promise<GlobalMacroReference> {
-  const apiKey = process.env.GEMINI_API_KEY?.trim();
-  if (!apiKey) return unavailable("GEMINI_API_KEY 未設定，無法執行聯網搜尋");
+async function attemptGroundedMacro(apiKey: string, model: string, signal: AbortSignal): Promise<GroundingAttempt> {
+  const endpointUrl = new URL(`${GEMINI_BASE_URL}/models/${encodeURIComponent(model)}:generateContent`);
+  endpointUrl.searchParams.set("key", apiKey);
+  const endpoint = endpointUrl.origin + endpointUrl.pathname;
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), MACRO_TIMEOUT_MS);
   try {
-    const model = await resolveMacroModel(apiKey, controller.signal);
-    if (!model) return unavailable("未找到可用的 Google Search Grounding Flash model");
-
-    const endpointUrl = new URL(`${GEMINI_BASE_URL}/models/${encodeURIComponent(model)}:generateContent`);
-    endpointUrl.searchParams.set("key", apiKey);
     const response = await fetch(endpointUrl.toString(), {
       method: "POST",
       headers: { "Content-Type": "application/json", Accept: "application/json" },
-      signal: controller.signal,
+      signal,
       body: JSON.stringify({
         systemInstruction: { parts: [{ text: systemInstruction() }] },
         contents: [{ role: "user", parts: [{ text: prompt() }] }],
@@ -184,11 +208,11 @@ async function generateMacro(): Promise<GlobalMacroReference> {
       })
     });
 
-    const endpoint = endpointUrl.origin + endpointUrl.pathname;
     if (!response.ok) {
       const responsePreview = (await response.text()).slice(0, 800);
-      console.warn("Global macro Gemini grounding failed", { status: response.status, model, endpoint, responsePreview });
-      return unavailable(`Google Search Grounding 暫時不可用（HTTP ${response.status}）`);
+      const reason = `HTTP ${response.status}`;
+      console.warn("Global macro Gemini grounding candidate failed", { status: response.status, model, endpoint, responsePreview, nextAttempt: true });
+      return { value: null, reason };
     }
 
     const body = await response.json() as GeminiResponse;
@@ -196,7 +220,9 @@ async function generateMacro(): Promise<GlobalMacroReference> {
     const rawText = candidate?.content?.parts?.map((part) => part.text ?? "").join("").trim() ?? "";
     const metadata = candidate?.groundingMetadata;
     const sources = toSources(metadata);
-    const queries = Array.isArray(metadata?.webSearchQueries) ? metadata.webSearchQueries.map((query) => text(query, 300)).filter(Boolean).slice(0, 12) : [];
+    const queries = Array.isArray(metadata?.webSearchQueries)
+      ? metadata.webSearchQueries.map((query) => text(query, 300)).filter(Boolean).slice(0, 12)
+      : [];
 
     console.info("Global macro Gemini grounding response", {
       model,
@@ -206,36 +232,70 @@ async function generateMacro(): Promise<GlobalMacroReference> {
       searchQueries: queries
     });
 
-    if (!rawText) return unavailable("Google Search Grounding 未回傳可用內容");
-    if (sources.length === 0 && queries.length === 0) return unavailable("Google Search Grounding 未提供可驗證的搜尋來源");
+    if (!rawText) return { value: null, reason: "未回傳可用內容" };
+    if (sources.length === 0 && queries.length === 0) return { value: null, reason: "未提供可驗證的搜尋來源" };
 
     let draft: MacroDraft;
     try {
       draft = JSON.parse(unwrapJson(rawText)) as MacroDraft;
     } catch (error) {
-      console.error("Global macro JSON parse failed", { model, reason: error instanceof Error ? error.message : String(error), rawText });
-      return unavailable("Google Search Grounding 回應格式無法驗證");
+      console.error("Global macro JSON parse failed", {
+        model,
+        reason: error instanceof Error ? error.message : String(error),
+        rawText
+      });
+      return { value: null, reason: "回應格式無法驗證" };
     }
 
     const generatedAt = new Date().toISOString();
-    const value: GlobalMacroReference = {
-      available: true,
-      dataNature: DATA_NATURE,
-      generatedAt,
-      cachedAt: generatedAt,
-      isStale: false,
-      model,
-      searchQueries: queries,
-      sources,
-      criticalMinerals: section("關鍵礦產（鋰、鈷、稀土）", text(draft.criticalMinerals) || UNAVAILABLE_TEXT, sources),
-      energyCommodities: section("能源商品（原油、天然氣）", text(draft.energyCommodities) || UNAVAILABLE_TEXT, sources),
-      preciousMetals: section("黃金／貴金屬", text(draft.preciousMetals) || UNAVAILABLE_TEXT, sources),
-      geopolitics: section("重大地緣政治動態與世界格局", text(draft.geopolitics) || UNAVAILABLE_TEXT, sources),
-      countryNews: section("各國重大新聞摘要", text(draft.countryNews) || UNAVAILABLE_TEXT, sources),
-      unavailableReason: null
+    return {
+      value: {
+        available: true,
+        dataNature: DATA_NATURE,
+        generatedAt,
+        cachedAt: generatedAt,
+        isStale: false,
+        model,
+        searchQueries: queries,
+        sources,
+        criticalMinerals: section("關鍵礦產（鋰、鈷、稀土）", text(draft.criticalMinerals) || UNAVAILABLE_TEXT, sources),
+        energyCommodities: section("能源商品（原油、天然氣）", text(draft.energyCommodities) || UNAVAILABLE_TEXT, sources),
+        preciousMetals: section("黃金／貴金屬", text(draft.preciousMetals) || UNAVAILABLE_TEXT, sources),
+        geopolitics: section("重大地緣政治動態與世界格局", text(draft.geopolitics) || UNAVAILABLE_TEXT, sources),
+        countryNews: section("各國重大新聞摘要", text(draft.countryNews) || UNAVAILABLE_TEXT, sources),
+        unavailableReason: null
+      },
+      reason: null
     };
-    macroCache = { value, expiresAt: Date.now() + MACRO_CACHE_TTL_MS };
-    return value;
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    console.warn("Global macro Gemini grounding candidate threw", { model, endpoint, reason, nextAttempt: true });
+    return { value: null, reason };
+  }
+}
+
+async function generateMacro(): Promise<GlobalMacroReference> {
+  const apiKey = process.env.GEMINI_API_KEY?.trim();
+  if (!apiKey) return unavailable("GEMINI_API_KEY 未設定，無法執行聯網搜尋");
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), MACRO_TIMEOUT_MS);
+  try {
+    const models = await resolveMacroModels(apiKey, controller.signal);
+    if (models.length === 0) return unavailable("未找到可用的 Google Search Grounding Flash model");
+
+    const reasons: string[] = [];
+    for (const model of models) {
+      const attempt = await attemptGroundedMacro(apiKey, model, controller.signal);
+      if (attempt.value) {
+        macroCache = { value: attempt.value, expiresAt: Date.now() + MACRO_CACHE_TTL_MS };
+        return attempt.value;
+      }
+      if (attempt.reason) reasons.push(`${model}: ${attempt.reason}`);
+    }
+
+    console.warn("Global macro all grounding candidates failed", { models, reasons });
+    return unavailable("Google Search Grounding 暫時不可用，已嘗試可用 Flash 候選模型");
   } catch (error) {
     console.error("Global macro request failed; returning null-safe fallback", error instanceof Error ? error.message : String(error));
     return unavailable("全球宏觀搜尋暫時不可用，請稍後再試");
