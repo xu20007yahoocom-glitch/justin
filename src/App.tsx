@@ -5,12 +5,13 @@
 
 import { useState, useEffect, useRef } from "react";
 import { Sparkles, RefreshCw, AlertTriangle, Play, Pause, Clock } from "lucide-react";
-import { StockQuote, AIAnalysisResult } from "./types";
-import { StockCard } from "./components/StockCard";
-import { StockChart } from "./components/StockChart";
-import { PortfolioCalculator } from "./components/PortfolioCalculator";
-import { AIAnalystPanel } from "./components/AIAnalystPanel";
-import { WhatsAppNotifications } from "./components/WhatsAppNotifications";
+import { StockQuote, AIAnalysisResult } from "./types.js";
+import { StockCard } from "./components/StockCard.js";
+import { StockChart } from "./components/StockChart.js";
+import { PortfolioCalculator } from "./components/PortfolioCalculator.js";
+import { AIAnalystPanel } from "./components/AIAnalystPanel.js";
+import { WhatsAppNotifications } from "./components/WhatsAppNotifications.js";
+import { GlobalMacroReferencePanel } from "./components/GlobalMacroReference.js";
 
 export default function App() {
   const [stocks, setStocks] = useState<StockQuote[]>([]);
@@ -240,6 +241,8 @@ export default function App() {
             />
           )}
         </section>
+
+        <GlobalMacroReferencePanel />
       </main>
     </div>
   );
