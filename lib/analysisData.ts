@@ -11,6 +11,7 @@ import type {
 } from "../src/types.js";
 import {
   detectMarketScope,
+  getFinnhubFinancials,
   getFinnhubFinancialsReported,
   getFinnhubMetric,
   getFinnhubProfile2,
@@ -18,6 +19,7 @@ import {
   isFinnhubSupportedMarket,
   normalizeFinnhubSymbol,
   type FinnhubFinancialsReportedResponse,
+  type FinnhubFinancialsResponse,
   type FinnhubMetricResponse,
   type FinnhubProfile2,
   type FinnhubRevenueBreakdownResponse,
@@ -123,24 +125,92 @@ function latestReportedFiling(data: FinnhubFinancialsReportedResponse | null) {
     .sort((a, b) => String(b.endDate ?? "").localeCompare(String(a.endDate ?? "")))[0] ?? null;
 }
 
+function normalizedFinancialKey(value: string): string {
+  return value.toLowerCase().replace(/[^a-z]/g, "");
+}
+
+/** Supports both Finnhub direct metric maps and Financials As Reported XBRL concept arrays. */
+function pickFinancialConcept(value: unknown, keys: string[], path = ""): { value: number | null; key: string | null } {
+  const normalizedKeys = new Set(keys.map(normalizedFinancialKey));
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      if (!item || typeof item !== "object") continue;
+      const record = item as Record<string, unknown>;
+      const concept = [record.concept, record.name, record.label, record.field]
+        .find((candidate): candidate is string => typeof candidate === "string");
+      const amount = finiteNumber(record.value ?? record.amount ?? record.val);
+      if (concept && normalizedKeys.has(normalizedFinancialKey(concept)) && amount !== null) {
+        return { value: amount, key: `${path}[].${concept}` };
+      }
+      const nested = pickFinancialConcept(record, keys, path ? `${path}[]` : "[]");
+      if (nested.value !== null) return nested;
+    }
+    return { value: null, key: null };
+  }
+  if (!value || typeof value !== "object") return { value: null, key: null };
+
+  const record = value as Record<string, unknown>;
+  for (const [key, candidate] of Object.entries(record)) {
+    if (normalizedKeys.has(normalizedFinancialKey(key))) {
+      const amount = finiteNumber(candidate);
+      if (amount !== null) return { value: amount, key: path ? `${path}.${key}` : key };
+    }
+  }
+  for (const [key, candidate] of Object.entries(record)) {
+    if (candidate && typeof candidate === "object") {
+      const nested = pickFinancialConcept(candidate, keys, path ? `${path}.${key}` : key);
+      if (nested.value !== null) return nested;
+    }
+  }
+  return { value: null, key: null };
+}
+
 function reportedIncomeField(
   response: FinnhubResult<FinnhubFinancialsReportedResponse> | null,
   keys: string[],
   unavailableReason: UnavailableReason
 ): SourcedField<number> {
   const filing = latestReportedFiling(response?.data ?? null);
-  const incomeStatement = filing?.report?.ic ?? {};
-  const picked = pickMetric(incomeStatement, keys);
+  const picked = pickFinancialConcept(filing?.report?.ic, keys, "data[].report.ic");
   return apiField(
     picked.value,
     "Finnhub Financials Reported",
     "/stock/financials-reported?symbol=&freq=annual",
-    picked.key ? `data[].report.ic.${picked.key}` : null,
+    picked.key,
     response?.fetchedAt ?? null,
     filing?.endDate ?? null,
     response?.isStale ?? false,
     unavailableReason
   );
+}
+
+function latestStandardIncomeStatement(data: FinnhubFinancialsResponse | null) {
+  const statements = Array.isArray(data?.financials) ? data.financials : [];
+  return statements
+    .sort((a, b) => String(b.endDate ?? "").localeCompare(String(a.endDate ?? "")))[0] ?? null;
+}
+
+function standardIncomeField(
+  response: FinnhubResult<FinnhubFinancialsResponse> | null,
+  keys: string[],
+  unavailableReason: UnavailableReason
+): SourcedField<number> {
+  const statement = latestStandardIncomeStatement(response?.data ?? null);
+  const picked = pickFinancialConcept(statement, keys, "financials[]");
+  return apiField(
+    picked.value,
+    "Finnhub Financials Reported",
+    "/stock/financials?symbol=&statement=ic&freq=annual",
+    picked.key,
+    response?.fetchedAt ?? null,
+    statement?.endDate ?? null,
+    response?.isStale ?? false,
+    unavailableReason
+  );
+}
+
+function firstAvailableFinancialField(primary: SourcedField<number>, fallback: SourcedField<number>): SourcedField<number> {
+  return primary.value !== null ? primary : fallback;
 }
 
 function uniqueNonOverlappingBusinesses(
@@ -257,8 +327,20 @@ function companyBackground(
 function buildFinancialMetrics(
   metric: FinnhubResult<FinnhubMetricResponse> | null,
   reported: FinnhubResult<FinnhubFinancialsReportedResponse> | null,
+  standardFinancials: FinnhubResult<FinnhubFinancialsResponse> | null,
   reason: UnavailableReason
 ): FinancialMetricSet {
+  const revenueKeys = ["Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax", "SalesRevenueNet", "Revenue", "TotalRevenue"];
+  const netIncomeKeys = ["NetIncomeLoss", "ProfitLoss", "NetIncome", "NetIncomeAvailableToCommonStockholders"];
+  const revenue = firstAvailableFinancialField(
+    reportedIncomeField(reported, revenueKeys, reason),
+    standardIncomeField(standardFinancials, revenueKeys, reason)
+  );
+  const netIncome = firstAvailableFinancialField(
+    reportedIncomeField(reported, netIncomeKeys, reason),
+    standardIncomeField(standardFinancials, netIncomeKeys, reason)
+  );
+
   return {
     pe: metricField(metric, ["peBasicExclExtraTTM", "peTTM", "pe"], reason),
     pb: metricField(metric, ["pbQuarterly", "priceToBook", "pbRatio", "pbAnnual"], reason),
@@ -267,12 +349,8 @@ function buildFinancialMetrics(
     grossMargin: metricField(metric, ["grossMarginTTM", "grossProfitMarginTTM", "grossMarginPercent"], reason),
     week52High: metricField(metric, ["52WeekHigh"], reason),
     week52Low: metricField(metric, ["52WeekLow"], reason),
-    revenue: reportedIncomeField(
-      reported,
-      ["Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax", "SalesRevenueNet", "Revenue"],
-      reason
-    ),
-    netIncome: reportedIncomeField(reported, ["NetIncomeLoss", "ProfitLoss"], reason)
+    revenue,
+    netIncome
   };
 }
 
@@ -298,6 +376,7 @@ export async function buildAnalysisContext(
         getFinnhubProfile2(quote.symbol),
         getFinnhubMetric(quote.symbol),
         getFinnhubFinancialsReported(quote.symbol, "annual"),
+        getFinnhubFinancials(quote.symbol, "annual"),
         getFinnhubRevenueBreakdown(quote.symbol)
       ])
     : null;
@@ -305,8 +384,18 @@ export async function buildAnalysisContext(
   const profile = (settled?.[0]?.status === "fulfilled" ? settled[0].value : null) as FinnhubResult<FinnhubProfile2> | null;
   const metric = (settled?.[1]?.status === "fulfilled" ? settled[1].value : null) as FinnhubResult<FinnhubMetricResponse> | null;
   const reported = (settled?.[2]?.status === "fulfilled" ? settled[2].value : null) as FinnhubResult<FinnhubFinancialsReportedResponse> | null;
-  const revenue = (settled?.[3]?.status === "fulfilled" ? settled[3].value : null) as FinnhubResult<FinnhubRevenueBreakdownResponse> | null;
-  const metrics = buildFinancialMetrics(metric, reported, reason);
+  const standardFinancials = (settled?.[3]?.status === "fulfilled" ? settled[3].value : null) as FinnhubResult<FinnhubFinancialsResponse> | null;
+  const revenue = (settled?.[4]?.status === "fulfilled" ? settled[4].value : null) as FinnhubResult<FinnhubRevenueBreakdownResponse> | null;
+  const metrics = buildFinancialMetrics(metric, reported, standardFinancials, reason);
+  console.info("Finnhub financial mapping", {
+    symbol: quote.symbol,
+    revenueAvailable: metrics.revenue.value !== null,
+    revenueEndpoint: metrics.revenue.endpoint,
+    revenueField: metrics.revenue.sourceField,
+    netIncomeAvailable: metrics.netIncome.value !== null,
+    netIncomeEndpoint: metrics.netIncome.endpoint,
+    netIncomeField: metrics.netIncome.sourceField
+  });
   const revenueBusinesses = uniqueNonOverlappingBusinesses(revenue, "公司未揭露業務營收拆分");
 
   const unavailable: AnalysisContext["unavailable"] = [];
