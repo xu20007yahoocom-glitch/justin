@@ -173,6 +173,36 @@ export interface AnalysisSourceLink {
   uri: string;
 }
 
+/** Google Search Grounding 正規化後的可點擊來源，不含未經驗證的模型自述來源。 */
+export interface GlobalMacroSource {
+  title: string;
+  url: string;
+}
+
+/** 所有文字均為 AI 聯網搜尋整理，而非可用作交易的即時行情。 */
+export interface GlobalMacroSection {
+  title: string;
+  summary: string;
+  sources: GlobalMacroSource[];
+}
+
+export interface GlobalMacroReference {
+  available: boolean;
+  dataNature: "AI 聯網搜尋整理，非即時行情，僅供參考";
+  generatedAt: string;
+  cachedAt: string | null;
+  isStale: boolean;
+  model: string | null;
+  searchQueries: string[];
+  sources: GlobalMacroSource[];
+  criticalMinerals: GlobalMacroSection;
+  energyCommodities: GlobalMacroSection;
+  preciousMetals: GlobalMacroSection;
+  geopolitics: GlobalMacroSection;
+  countryNews: GlobalMacroSection;
+  unavailableReason: string | null;
+}
+
 /** 舊版推薦與技術面卡片仍可使用；新增欄位皆來自 StockAnalysis。 */
 export interface AnalysisResult extends StockAnalysis {
   companyName: string;
