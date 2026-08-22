@@ -173,33 +173,48 @@ export interface AnalysisSourceLink {
   uri: string;
 }
 
-/** Google Search Grounding 正規化後的可點擊來源，不含未經驗證的模型自述來源。 */
+/** 真实宏观数据的可点击来源，时间为该来源返回的观测／文章时间。 */
+export type GlobalMacroProvider = "FRED" | "EIA" | "GDELT";
+
 export interface GlobalMacroSource {
+  provider: GlobalMacroProvider;
   title: string;
   url: string;
+  dataTime: string | null;
 }
 
-/** 所有文字均為 AI 聯網搜尋整理，而非可用作交易的即時行情。 */
+/** 单条数据从不使用估算值或占位数字；不可用时 value 固定为“暂无可靠资料”。 */
+export interface GlobalMacroItem {
+  label: string;
+  value: string;
+  unit: string | null;
+  dataTime: string | null;
+  source: GlobalMacroSource | null;
+  note: string;
+  available: boolean;
+}
+
+/** 五个真实数据板块之一，每项显示数据来源与数据时间。 */
 export interface GlobalMacroSection {
   title: string;
   summary: string;
+  updatedAt: string | null;
+  items: GlobalMacroItem[];
   sources: GlobalMacroSource[];
 }
 
 export interface GlobalMacroReference {
   available: boolean;
-  dataNature: "AI 聯網搜尋整理，非即時行情，僅供參考";
+  dataNature: "真实数据整理，非实时，定期更新";
   generatedAt: string;
   cachedAt: string | null;
   isStale: boolean;
-  model: string | null;
-  searchQueries: string[];
   sources: GlobalMacroSource[];
-  criticalMinerals: GlobalMacroSection;
-  energyCommodities: GlobalMacroSection;
   preciousMetals: GlobalMacroSection;
-  geopolitics: GlobalMacroSection;
-  countryNews: GlobalMacroSection;
+  energyPrices: GlobalMacroSection;
+  countryEnergy: GlobalMacroSection;
+  centralBankRates: GlobalMacroSection;
+  geopoliticalNews: GlobalMacroSection;
   unavailableReason: string | null;
 }
 
