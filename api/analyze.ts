@@ -215,12 +215,13 @@ function buildSystemInstruction(language: string): string {
 4. topRevenueBusinesses 的 revenueSharePercent 與 revenueAmount 完全由伺服器控制。你只能寫 description，不可補數字或百分比；如果 API 沒資料，伺服器會顯示「佔比未知」。
 5. 對港股與 A 股（marketScope 為 HK 或 CN，或 finnhubSupported=false），不得暗示使用了即時 Finnhub 財報；所有研究性敘述都是「AI 綜合判斷，非即時財報數據」。
 6. catalysts、competitors、competitiveAdvantage 是定性研究，不能編造近期公告、事件、財務數字、市占或精確時間點。若無充分背景，輸出空陣列或「需查證」。
-7. 僅輸出合法 JSON；不要包覆 Markdown、不要輸出資料來源以外的前言。`;
+7. 僅輸出合法 JSON；不要包覆 Markdown、不要輸出資料來源以外的前言。
+8. 回應必須是單一 JSON 物件；絕不可輸出 JSON 程式碼區塊、Markdown 或任何 JSON 以外文字。`;
 }
 
 function buildPrompt(context: AnalysisContext, dataLimitations: string[]): string {
   const payload = { symbol: context.quote.symbol, companyName: context.quote.companyName, marketScope: context.marketScope, finnhubSupported: context.finnhubSupported, quote: context.quote, technicals: context.technicals, companyBackground: context.companyBackgroundBase, financialMetrics: context.financialMetrics, topRevenueBusinesses: context.revenueBusinesses, unavailable: context.unavailable, dataLimitations };
-  return "你是股票研究的文字分析器。只使用 payload 中已有的精確數字；缺漏資料只能定性說明，不得捏造營收、淨利、市值、估值倍率、毛利率、52 週價格或業務佔比。只輸出合法 JSON。\n\nPAYLOAD:\n" + JSON.stringify(payload) + "\n\n輸出 JSON 欄位：recommendation、recommendationReason、confidenceLevel、summary、outlook、risks、technicalSummary、valuation、oneLineSummary、companyPositioning、catalysts、competitors、competitiveAdvantage。";
+  return "你是股票研究的文字分析器。只使用 payload 中已有的精確數字；缺漏資料只能定性說明，不得捏造營收、淨利、市值、估值倍率、毛利率、52 週價格或業務佔比。只輸出單一合法 JSON 物件；不要輸出 ```json 程式碼區塊、Markdown 或任何額外文字。\n\nPAYLOAD:\n" + JSON.stringify(payload) + "\n\n輸出 JSON 欄位：recommendation、recommendationReason、confidenceLevel、summary、outlook、risks、technicalSummary、valuation、oneLineSummary、companyPositioning、catalysts、competitors、competitiveAdvantage。";
 }
 
 class GeminiHttpError extends Error {
@@ -269,6 +270,28 @@ function isUnavailableModel404(error: GeminiHttpError): boolean {
   );
 }
 
+function unwrapGeminiJson(responseText: string): string {
+  const trimmed = responseText.trim();
+  const wrapped = trimmed.match(/^```(?:json)?\s*\r?\n?([\s\S]*?)\s*```$/i);
+  return (wrapped?.[1] ?? trimmed).trim();
+}
+
+function parseGeminiAnalysisDraft(responseText: string, model: string): GeminiAnalysisDraft {
+  console.log("Gemini raw response:", responseText);
+  const jsonText = unwrapGeminiJson(responseText);
+  try {
+    return JSON.parse(jsonText) as GeminiAnalysisDraft;
+  } catch (error) {
+    console.error("Gemini JSON parse failed", {
+      model,
+      reason: error instanceof Error ? error.message : String(error),
+      rawResponse: responseText,
+      normalizedJsonText: jsonText
+    });
+    throw new Error("Gemini response JSON parsing failed for model " + model);
+  }
+}
+
 async function callGemini(
   model: string,
   prompt: string,
@@ -302,8 +325,11 @@ async function callGemini(
 
   const body = (await response.json()) as GeminiResponse;
   const responseText = body.candidates?.[0]?.content?.parts?.map((part) => part.text ?? "").join("").trim();
-  if (!responseText) throw new Error("Gemini response contained no text");
-  return JSON.parse(responseText) as GeminiAnalysisDraft;
+  if (!responseText) {
+    console.error("Gemini response contained no text", { model, body });
+    throw new Error("Gemini response contained no text");
+  }
+  return parseGeminiAnalysisDraft(responseText, model);
 }
 
 function isTransientGeminiError(error: unknown): error is GeminiHttpError {
