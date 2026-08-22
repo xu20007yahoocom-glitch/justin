@@ -50,6 +50,7 @@ export type AnalysisSource =
   | "Finnhub Metric"
   | "Finnhub Financials Reported"
   | "Finnhub Revenue Breakdown"
+  | "FMP Income Statement（年報／可能延遲）"
   | "Yahoo Finance"
   | "Gemini 推理"
   | "模擬分析 fallback"
@@ -64,6 +65,11 @@ export type UnavailableReason =
   | "Finnhub 額度已達上限"
   | "Finnhub 回傳無此欄位"
   | "Finnhub 請求失敗"
+  | "FMP_API_KEY 未設定"
+  | "FMP 端點權限不足"
+  | "FMP 額度已達上限"
+  | "FMP 回傳無此欄位"
+  | "FMP 請求失敗"
   | "公司未揭露業務營收拆分"
   | "尚無可用資料";
 
