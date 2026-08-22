@@ -67,6 +67,21 @@ export interface FinnhubFinancialsReportedResponse {
   symbol?: string;
 }
 
+/** Standardised Financial Statements income statement response. Finnhub may expose `report.ic`
+ * or direct statement keys depending on the issuer and plan; mapping remains key-based. */
+export interface FinnhubFinancialsStatement {
+  endDate?: string;
+  period?: string;
+  report?: { ic?: Record<string, unknown> };
+  year?: number | string;
+  [key: string]: unknown;
+}
+
+export interface FinnhubFinancialsResponse {
+  financials?: FinnhubFinancialsStatement[];
+  symbol?: string;
+}
+
 export interface FinnhubRevenueBreakdownItem {
   label?: string;
   member?: string;
@@ -101,6 +116,31 @@ export interface FinnhubRevenueBreakdownResponse {
 
 const cache = new Map<string, CacheEntry<unknown>>();
 const inFlight = new Map<string, Promise<FinnhubResult<unknown> | null>>();
+
+const REVENUE_KEY_NAMES = new Set([
+  "revenue", "revenues", "totalrevenue", "salesrevenue", "salesrevenuenet",
+  "revenuefromcontractwithcustomerexcludingassessedtax"
+]);
+const NET_INCOME_KEY_NAMES = new Set([
+  "netincome", "netincomeloss", "profitloss", "netincomeavailabletocommonstockholders"
+]);
+
+function normalizeFieldName(value: string): string {
+  return value.toLowerCase().replace(/[^a-z]/g, "");
+}
+
+function containsFinancialField(value: unknown, wanted: Set<string>, depth = 0): boolean {
+  if (depth > 8 || value === null || value === undefined) return false;
+  if (Array.isArray(value)) return value.some((item) => containsFinancialField(item, wanted, depth + 1));
+  if (typeof value !== "object") return false;
+  return Object.entries(value).some(([key, child]) => (
+    wanted.has(normalizeFieldName(key)) || containsFinancialField(child, wanted, depth + 1)
+  ));
+}
+
+function isFinancialEndpoint(path: string): boolean {
+  return path.startsWith("/stock/financials-reported") || path.startsWith("/stock/financials?");
+}
 
 function getMarketScope(symbol: string): MarketScope {
   const normalized = symbol.trim().toUpperCase();
@@ -169,7 +209,19 @@ function cacheFailure(key: string, status: number | null): void {
 
 async function requestJson<T>(path: string): Promise<{ body: T; fetchedAt: string }> {
   const apiKey = process.env.FINNHUB_API_KEY;
-  if (!apiKey) throw new Error("FINNHUB_API_KEY_MISSING");
+  if (!apiKey) {
+    if (isFinancialEndpoint(path)) {
+      console.warn("Finnhub financial endpoint response", {
+        endpoint: path,
+        httpStatus: null,
+        ok: false,
+        reason: "FINNHUB_API_KEY_MISSING",
+        hasRevenueField: false,
+        hasNetIncomeField: false
+      });
+    }
+    throw new Error("FINNHUB_API_KEY_MISSING");
+  }
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
@@ -184,12 +236,33 @@ async function requestJson<T>(path: string): Promise<{ body: T; fetchedAt: strin
     });
 
     if (!response.ok) {
+      const responsePreview = (await response.text()).slice(0, 600);
+      if (isFinancialEndpoint(path)) {
+        console.warn("Finnhub financial endpoint response", {
+          endpoint: path,
+          httpStatus: response.status,
+          ok: false,
+          hasRevenueField: false,
+          hasNetIncomeField: false,
+          responsePreview
+        });
+      }
       const error = new Error(`Finnhub HTTP ${response.status}`) as Error & { status?: number };
       error.status = response.status;
       throw error;
     }
 
-    return { body: (await response.json()) as T, fetchedAt: new Date().toISOString() };
+    const body = (await response.json()) as T;
+    if (isFinancialEndpoint(path)) {
+      console.info("Finnhub financial endpoint response", {
+        endpoint: path,
+        httpStatus: response.status,
+        ok: true,
+        hasRevenueField: containsFinancialField(body, REVENUE_KEY_NAMES),
+        hasNetIncomeField: containsFinancialField(body, NET_INCOME_KEY_NAMES)
+      });
+    }
+    return { body, fetchedAt: new Date().toISOString() };
   } finally {
     clearTimeout(timeout);
   }
@@ -267,6 +340,24 @@ export async function getFinnhubFinancialsReported(
     return await getEndpoint<FinnhubFinancialsReportedResponse>(
       `finnhub:financials-reported:${symbol}:${frequency}`,
       `/stock/financials-reported?symbol=${encodeURIComponent(symbol)}&freq=${frequency}`,
+      FINANCIALS_TTL_MS
+    );
+  } catch {
+    return null;
+  }
+}
+
+/** Standardised income statement. Used only when Financials As Reported has no usable revenue/net-income key. */
+export async function getFinnhubFinancials(
+  symbolInput: string,
+  frequency: "annual" | "quarterly" = "annual"
+): Promise<FinnhubResult<FinnhubFinancialsResponse> | null> {
+  const symbol = normalizeFinnhubSymbol(symbolInput);
+  if (!symbol) return null;
+  try {
+    return await getEndpoint<FinnhubFinancialsResponse>(
+      `finnhub:financials:${symbol}:ic:${frequency}`,
+      `/stock/financials?symbol=${encodeURIComponent(symbol)}&statement=ic&freq=${frequency}`,
       FINANCIALS_TTL_MS
     );
   } catch {
