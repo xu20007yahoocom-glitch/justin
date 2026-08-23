@@ -174,7 +174,7 @@ export interface AnalysisSourceLink {
 }
 
 /** 真实宏观数据的可点击来源，时间为该来源返回的观测／文章时间。 */
-export type GlobalMacroProvider = "FRED" | "EIA" | "GDELT";
+export type GlobalMacroProvider = "FRED" | "EIA" | "GDELT" | "USGS" | "Mining.com";
 
 export interface GlobalMacroSource {
   provider: GlobalMacroProvider;
@@ -203,6 +203,39 @@ export interface GlobalMacroSection {
   sources: GlobalMacroSource[];
 }
 
+/** USGS 年度矿产数据的国家级条目。生产与储量的单位必须分别显示，避免跨矿产误读。 */
+export interface CriticalMineralCountryStat {
+  country: string;
+  production: string | null;
+  reserves: string | null;
+}
+
+/** 单一矿产的 USGS 年度静态数据；所有数字均为来源原文字符串，绝不转换或估算。 */
+export interface CriticalMineralRecord {
+  id: string;
+  name: string;
+  productionYear: string | null;
+  reserveYear: string | null;
+  productionUnit: string | null;
+  reserveUnit: string | null;
+  globalProduction: string | null;
+  globalReserves: string | null;
+  countries: CriticalMineralCountryStat[];
+  source: GlobalMacroSource;
+  note: string;
+  available: boolean;
+}
+
+/** 关键矿产由 USGS 年度储量／产量与 Mining.com RSS 新闻两栏组成。 */
+export interface CriticalMineralsSection {
+  title: string;
+  summary: string;
+  updatedAt: string | null;
+  minerals: CriticalMineralRecord[];
+  news: GlobalMacroItem[];
+  sources: GlobalMacroSource[];
+}
+
 export interface GlobalMacroReference {
   available: boolean;
   dataNature: "真实数据整理，非实时，定期更新";
@@ -210,6 +243,7 @@ export interface GlobalMacroReference {
   cachedAt: string | null;
   isStale: boolean;
   sources: GlobalMacroSource[];
+  criticalMinerals: CriticalMineralsSection;
   preciousMetals: GlobalMacroSection;
   energyPrices: GlobalMacroSection;
   countryEnergy: GlobalMacroSection;
