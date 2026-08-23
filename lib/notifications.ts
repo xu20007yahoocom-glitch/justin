@@ -38,30 +38,45 @@ const MAX_LOGS = 25;
 export const FIFTEEN_MINUTES_MS = 15 * 60 * 1000;
 
 /**
- * Resolve the public dashboard URL used in the "🔗 Live Dashboard:" footer
- * of outgoing Telegram alerts. Centralized here so every caller (scheduled
- * cron alert, manual test alert, etc.) is guaranteed to produce an
- * identical, always-populated link instead of each duplicating
- * `process.env.APP_URL || ""` independently (which silently produced an
- * empty link whenever APP_URL wasn't set for that particular deployment).
- *
- * Resolution order:
- *   1. APP_URL    — explicit override, works on both Vercel and Cloud Run.
- *                   Set this to your canonical public domain (e.g. Cloud
- *                   Run's https://ais-dev-xxx.run.app, or your Vercel
- *                   production domain).
- *   2. VERCEL_URL — auto-injected by Vercel on every deployment (preview +
- *                   production) as a bare host, e.g. "my-app.vercel.app"
- *                   (no protocol). Used as a same-deployment fallback so
- *                   the link is never blank even if APP_URL was never
- *                   configured on Vercel.
- *   3. ""         — last resort if neither is available (e.g. local dev
- *                   without .env set).
+ * Normalize the canonical server-side dashboard URL. Recipient-facing
+ * Telegram links must never use a preview request host or VERCEL_URL.
  */
-export function getDashboardUrl(): string {
-  if (process.env.APP_URL) return process.env.APP_URL;
-  if (process.env.VERCEL_URL) return `https://${process.env.VERCEL_URL}`;
-  return "";
+function normalizeDashboardUrl(raw: string | undefined): string | null {
+  const trimmed = raw?.trim();
+  if (!trimmed) return null;
+
+  let candidate = trimmed.replace(/^(?:https?:\/\/){2,}/i, "https://");
+  if (!/^[a-z][a-z\d+.-]*:\/\//i.test(candidate)) candidate = `https://${candidate}`;
+
+  try {
+    const parsed = new URL(candidate);
+    if ((parsed.protocol !== "https:" && parsed.protocol !== "http:") || !parsed.hostname || parsed.username || parsed.password) {
+      return null;
+    }
+    parsed.hash = "";
+    parsed.pathname = parsed.pathname.replace(/\/+$/g, "") || "/";
+    const normalized = parsed.toString().replace(/\/+$/g, "");
+    return `${normalized}/`;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Canonical recipient-facing dashboard URL. Resolution order is intentionally
+ * restricted to a configured production URL; APP_URL, VERCEL_URL and request
+ * hosts are never used because they may identify a preview deployment.
+ */
+export function getDashboardUrl(): string | null {
+  return normalizeDashboardUrl(process.env.DASHBOARD_PUBLIC_URL)
+    ?? normalizeDashboardUrl(process.env.VERCEL_PROJECT_PRODUCTION_URL);
+}
+
+/** Safe Telegram Markdown footer, or an empty string when no canonical URL is configured. */
+export function getLiveDashboardFooter(): string {
+  const url = getDashboardUrl();
+  // URL() has normalized and encoded the value above; this fixed label is Markdown-safe.
+  return url ? `\n\n🔗 [Live Dashboard](${url})` : "";
 }
 
 export function getSettings(): WhatsAppSettings {
