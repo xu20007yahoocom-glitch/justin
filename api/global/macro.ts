@@ -2,7 +2,10 @@ import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { getEiaInternationalLatest, type EiaInternationalObservation, type EiaResult } from "../../lib/providers/eia.js";
 import { getFredLatestObservation, type FredLatestObservation, type FredResult } from "../../lib/providers/fred.js";
 import { getGdeltRecentArticles, type GdeltArticle, type GdeltResult } from "../../lib/providers/gdelt.js";
+import { getMiningComMineralNews, MINING_RSS_URL, type MineralRssArticle, type MineralRssResult } from "../../lib/providers/mineral-rss.js";
+import { USGS_CRITICAL_MINERALS_2026, USGS_DATA_YEAR } from "../../lib/data/mineral-reserves.js";
 import type {
+  CriticalMineralsSection,
   GlobalMacroItem,
   GlobalMacroProvider,
   GlobalMacroReference,
@@ -140,7 +143,41 @@ function gdeltItems(label: string, result: GdeltResult<GdeltArticle[]> | null): 
   }));
 }
 
+function mineralNewsItems(result: MineralRssResult<MineralRssArticle[]> | null): GlobalMacroItem[] {
+  if (!result) {
+    return [unavailableItem("近期矿产新闻", "Mining.com", "Mining.com RSS", MINING_RSS_URL, "Mining.com RSS 未返回可验证矿产新闻；非实时，定期更新")];
+  }
+  return result.data.map((article) => ({
+    label: article.title,
+    value: "新闻来源：Mining.com",
+    unit: null,
+    dataTime: article.publishedAt,
+    source: {
+      provider: "Mining.com",
+      title: article.title,
+      url: article.url,
+      dataTime: article.publishedAt
+    },
+    note: `${result.isStale ? "服务端缓存可能过期；" : ""}Mining.com RSS 本地矿产关键词筛选；非实时，定期更新`,
+    available: true
+  }));
+}
+
+function criticalMineralsSection(newsResult: MineralRssResult<MineralRssArticle[]> | null): CriticalMineralsSection {
+  const news = mineralNewsItems(newsResult);
+  const mineralSources = USGS_CRITICAL_MINERALS_2026.map((mineral) => mineral.source);
+  return {
+    title: "关键矿产",
+    summary: "USGS 年度储量／矿山产量与 Mining.com RSS 新闻；产量与储量单位分别显示，非实时，定期更新",
+    updatedAt: newsResult?.fetchedAt ?? USGS_DATA_YEAR,
+    minerals: USGS_CRITICAL_MINERALS_2026,
+    news,
+    sources: dedupeSources([...mineralSources, ...news.map((item) => item.source)])
+  };
+}
+
 function unavailable(reason: string): GlobalMacroReference {
+  const criticalMinerals = criticalMineralsSection(null);
   const preciousMetals = section("贵金属", [
     unavailableItem("黄金现货价", "FRED", "FRED：LMBA Gold Price 日度数据已移除", FRED_LMBA_REMOVAL_URL, "未使用已移除的 FRED LMBA 金价 series；非实时，定期更新")
   ]);
@@ -170,12 +207,14 @@ function unavailable(reason: string): GlobalMacroReference {
     cachedAt: null,
     isStale: false,
     sources: dedupeSources([
+      ...criticalMinerals.sources,
       ...preciousMetals.sources,
       ...energyPrices.sources,
       ...countryEnergy.sources,
       ...centralBankRates.sources,
       ...geopoliticalNews.sources
     ]),
+    criticalMinerals,
     preciousMetals,
     energyPrices,
     countryEnergy,
@@ -187,7 +226,7 @@ function unavailable(reason: string): GlobalMacroReference {
 
 async function generateMacro(): Promise<GlobalMacroReference> {
   try {
-    const [wti, brent, henryHub, fedFunds, fedTargetUpper, ecbDeposit, chinaConsumption, usConsumption, geopolitical, energyNews] = await Promise.all([
+    const [wti, brent, henryHub, fedFunds, fedTargetUpper, ecbDeposit, chinaConsumption, usConsumption, geopolitical, energyNews, mineralNews] = await Promise.all([
       getFredLatestObservation("DCOILWTICO"),
       getFredLatestObservation("POILBREUSDM"),
       getFredLatestObservation("DHHNGSP"),
@@ -197,8 +236,11 @@ async function generateMacro(): Promise<GlobalMacroReference> {
       getEiaInternationalLatest({ activityId: "2", productId: "5", countryRegionId: "CHN", unit: "TBPD" }),
       getEiaInternationalLatest({ activityId: "2", productId: "5", countryRegionId: "USA", unit: "TBPD" }),
       getGdeltRecentArticles("geopolitics"),
-      getGdeltRecentArticles("energy")
+      getGdeltRecentArticles("energy"),
+      getMiningComMineralNews()
     ]);
+
+    const criticalMinerals = criticalMineralsSection(mineralNews);
 
     // FRED removed the LMBA Gold Price daily series. This item intentionally remains unavailable rather than substituting an estimate.
     const preciousMetals = section("贵金属", [
@@ -230,15 +272,17 @@ async function generateMacro(): Promise<GlobalMacroReference> {
     const geopoliticalNews = section("地缘政治／全球新闻", geopoliticalItems, "GDELT 新闻索引；仅展示来源文章元数据，非实时，定期更新");
 
     const sources = dedupeSources([
+      ...criticalMinerals.sources,
       ...preciousMetals.sources,
       ...energyPrices.sources,
       ...countryEnergy.sources,
       ...centralBankRates.sources,
       ...geopoliticalNews.sources
     ]);
-    const anyStale = [wti, brent, henryHub, fedFunds, fedTargetUpper, ecbDeposit, chinaConsumption, usConsumption, geopolitical, energyNews]
+    const anyStale = [wti, brent, henryHub, fedFunds, fedTargetUpper, ecbDeposit, chinaConsumption, usConsumption, geopolitical, energyNews, mineralNews]
       .some((result) => result?.isStale === true);
-    const available = [
+    const available = criticalMinerals.minerals.some((mineral) => mineral.available) || [
+      ...criticalMinerals.news,
       ...preciousMetals.items,
       ...energyPrices.items,
       ...countryEnergy.items,
@@ -253,6 +297,7 @@ async function generateMacro(): Promise<GlobalMacroReference> {
       cachedAt: new Date().toISOString(),
       isStale: anyStale,
       sources,
+      criticalMinerals,
       preciousMetals,
       energyPrices,
       countryEnergy,
