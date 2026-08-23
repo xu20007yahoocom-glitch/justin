@@ -15,6 +15,7 @@ import type {
 } from "../../src/types.js";
 
 const MACRO_CACHE_TTL_MS = 30 * 60 * 1_000;
+const MACRO_NEWS_RETRY_TTL_MS = 60 * 1_000;
 const DATA_NATURE = "真实数据整理，非实时，定期更新" as const;
 const UNAVAILABLE_TEXT = "暂无可靠资料";
 const EIA_INTERNATIONAL_URL = "https://www.eia.gov/international/data/world/";
@@ -203,16 +204,21 @@ async function mapWithConcurrency<T, R>(values: readonly T[], limit: number, map
 
 async function generateMacro(): Promise<GlobalMacroReference> {
   try {
-    const [wti, brent, henryHub, geopolitical, energyNews, mineralNews, rateResults, energyResults] = await Promise.all([
+    const newsPromise = Promise.allSettled([
+      getGdeltRecentArticles("geopolitical"),
+      getGdeltRecentArticles("economic")
+    ]);
+    const [wti, brent, henryHub, mineralNews, rateResults, energyResults] = await Promise.all([
       getFredLatestObservation("DCOILWTICO"),
       getFredLatestObservation("POILBREUSDM"),
       getFredLatestObservation("DHHNGSP"),
-      getGdeltRecentArticles("geopolitics"),
-      getGdeltRecentArticles("energy"),
       getMiningComMineralNews(),
       mapWithConcurrency(FRED_MAJOR_RATE_DEFINITIONS, 2, (definition) => getFredCountryRate(definition)),
       mapWithConcurrency(EIA_MAJOR_ENERGY_COUNTRIES, 1, (definition) => getEiaCountryEnergy(definition))
     ]);
+    const [geopoliticalSettled, economicSettled] = await newsPromise;
+    const geopolitical = geopoliticalSettled.status === "fulfilled" ? geopoliticalSettled.value : null;
+    const economicNews = economicSettled.status === "fulfilled" ? economicSettled.value : null;
     const criticalMinerals = criticalMineralsSection(mineralNews);
     const preciousMetals = section("贵金属", [unavailableItem("黄金现货价", "FRED", "FRED：LMBA Gold Price 日度数据已移除", FRED_LMBA_REMOVAL_URL, "FRED 当前未提供本端点可验证的黄金现货 series；非实时，定期更新")], "黄金现货未取得可验证 FRED 观测值，显示暂无可靠资料");
     const energyPrices = section("能源价格", [
@@ -230,10 +236,10 @@ async function generateMacro(): Promise<GlobalMacroReference> {
       FRED_MAJOR_RATE_DEFINITIONS.map((definition, index) => fredCountryGroup(definition.country, rateResults[index])),
       "FRED 动态 series 搜索后再以 observations 核验；每项保留 FRED 原始单位与观测时间；非实时，定期更新"
     );
-    const geopoliticalNews = section("地缘政治／全球新闻", [...gdeltItems("地缘政治新闻", geopolitical), ...gdeltItems("能源相关新闻", energyNews)], "GDELT 新闻索引；仅展示来源文章元数据，非实时，定期更新");
+    const geopoliticalNews = section("地缘政治／全球新闻", [...gdeltItems("地缘政治新闻", geopolitical), ...gdeltItems("经济相关新闻", economicNews)], "GDELT 新闻索引；仅展示来源文章元数据，非实时，定期更新");
     const sources = dedupeSources([...criticalMinerals.sources, ...preciousMetals.sources, ...energyPrices.sources, ...countryEnergy.sources, ...centralBankRates.sources, ...geopoliticalNews.sources]);
     const allCountryItems = [...(countryEnergy.countries ?? []).flatMap((country) => country.items), ...(centralBankRates.countries ?? []).flatMap((country) => country.items)];
-    const allResults = [wti, brent, henryHub, geopolitical, energyNews, mineralNews, ...rateResults, ...energyResults];
+    const allResults = [wti, brent, henryHub, geopolitical, economicNews, mineralNews, ...rateResults, ...energyResults];
     const available = criticalMinerals.minerals.some((mineral) => mineral.available) || [...criticalMinerals.news, ...preciousMetals.items, ...energyPrices.items, ...allCountryItems, ...geopoliticalNews.items].some((item) => item.available);
     const value: GlobalMacroReference = {
       available, dataNature: DATA_NATURE, generatedAt: new Date().toISOString(), cachedAt: new Date().toISOString(),
@@ -241,7 +247,8 @@ async function generateMacro(): Promise<GlobalMacroReference> {
       energyPrices, countryEnergy, centralBankRates, geopoliticalNews,
       unavailableReason: available ? null : "所有数据源暂时不可用或未配置相应密钥"
     };
-    macroCache = { value, expiresAt: Date.now() + MACRO_CACHE_TTL_MS };
+    const cacheTtl = geopolitical && economicNews ? MACRO_CACHE_TTL_MS : MACRO_NEWS_RETRY_TTL_MS;
+    macroCache = { value, expiresAt: Date.now() + cacheTtl };
     return value;
   } catch (error) {
     console.error("Global macro real-data assembly failed; returning null-safe fallback", error instanceof Error ? error.message : String(error));
