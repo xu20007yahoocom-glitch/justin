@@ -195,11 +195,21 @@ export interface GlobalMacroItem {
 }
 
 /** 五个真实数据板块之一，每项显示数据来源与数据时间。 */
+/** 同一国家的多个宏观指标；每个条目独立保留单位、观测时间与来源。 */
+export interface GlobalMacroCountryGroup {
+  country: string;
+  updatedAt: string | null;
+  items: GlobalMacroItem[];
+  available: boolean;
+}
+
 export interface GlobalMacroSection {
   title: string;
   summary: string;
   updatedAt: string | null;
   items: GlobalMacroItem[];
+  /** 国家级板块使用；缺失时代表该板块仅含非分组项目。 */
+  countries?: GlobalMacroCountryGroup[];
   sources: GlobalMacroSource[];
 }
 
