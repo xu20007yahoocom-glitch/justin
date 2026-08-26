@@ -1,7 +1,7 @@
 const MINING_RSS_URL = "https://www.mining.com/feed/";
 const REQUEST_TIMEOUT_MS = 15_000;
 const RSS_CACHE_TTL_MS = 30 * 60 * 1_000;
-const FAILURE_TTL_MS = 5 * 60 * 1_000;
+const FAILURE_TTL_MS = 60_000;
 const STALE_TTL_MS = 2 * 60 * 60 * 1_000;
 const MAX_ARTICLES = 8;
 
@@ -12,16 +12,16 @@ const MINERAL_KEYWORDS = [
 ];
 
 interface CacheEntry<T> {
-  value: T | null;
+  value: T;
   expiresAt: number;
   staleUntil: number;
-  fetchedAt: string | null;
+  fetchedAt: string;
 }
 
 export interface MineralRssArticle {
   title: string;
   url: string;
-  publishedAt: string;
+  publishedAt: string | null;
   description: string | null;
   categories: string[];
 }
@@ -32,8 +32,21 @@ export interface MineralRssResult<T> {
   isStale: boolean;
 }
 
-const cache = new Map<string, CacheEntry<unknown>>();
+interface ParseResult {
+  rawItemCount: number;
+  parsedCount: number;
+  filteredCount: number;
+  articles: MineralRssArticle[];
+}
+
+const cache = new Map<string, CacheEntry<MineralRssArticle[]>>();
+const failureCacheUntil = new Map<string, number>();
 let inFlight: Promise<MineralRssResult<MineralRssArticle[]> | null> | null = null;
+
+function diagnostic(payload: Record<string, unknown>): void {
+  // Never records a full RSS body, article body, credentials or private headers.
+  console.info("MINING_RSS_DIAGNOSTIC", payload);
+}
 
 function decodeXml(value: string): string {
   return value
@@ -56,10 +69,7 @@ function xmlText(block: string, tag: string): string | null {
 
 function xmlAllText(block: string, tag: string): string[] {
   const expression = new RegExp(`<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${tag}>`, "gi");
-  return [...block.matchAll(expression)]
-    .map((match) => decodeXml(match[1]))
-    .filter(Boolean)
-    .slice(0, 12);
+  return [...block.matchAll(expression)].map((match) => decodeXml(match[1])).filter(Boolean).slice(0, 12);
 }
 
 function validHttpUrl(value: string | null): string | null {
@@ -77,40 +87,46 @@ function matchesMineralKeywords(article: MineralRssArticle): boolean {
   return MINERAL_KEYWORDS.some((keyword) => haystack.includes(keyword));
 }
 
-function parseArticles(xml: string): MineralRssArticle[] {
-  const itemBlocks = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/gi)].map((match) => match[1]);
+function parseArticles(xml: string): ParseResult {
+  const blocks = [...xml.matchAll(/<item(?:\s[^>]*)?>([\s\S]*?)<\/item>/gi)].map((match) => match[1]);
   const seen = new Set<string>();
-  return itemBlocks.flatMap((block) => {
+  let parsedCount = 0;
+  const parsed: MineralRssArticle[] = [];
+  for (const block of blocks) {
     const title = xmlText(block, "title");
     const url = validHttpUrl(xmlText(block, "link"));
-    const publishedAt = xmlText(block, "pubDate");
-    if (!title || !url || !publishedAt || seen.has(url)) return [];
+    // Publication date, image, description, author and categories are all optional.
+    if (!title || !url || seen.has(url)) continue;
     seen.add(url);
-    const article: MineralRssArticle = {
+    parsedCount += 1;
+    parsed.push({
       title: title.slice(0, 500),
       url,
-      publishedAt: publishedAt.slice(0, 128),
+      publishedAt: xmlText(block, "pubDate")?.slice(0, 128) ?? null,
       description: xmlText(block, "description")?.slice(0, 1_000) ?? null,
       categories: xmlAllText(block, "category")
-    };
-    return matchesMineralKeywords(article) ? [article] : [];
-  }).slice(0, MAX_ARTICLES);
+    });
+  }
+  const articles = parsed.filter(matchesMineralKeywords).slice(0, MAX_ARTICLES);
+  return { rawItemCount: blocks.length, parsedCount, filteredCount: articles.length, articles };
 }
 
-function getCached<T>(key: string): { fresh: MineralRssResult<T> | null; stale: MineralRssResult<T> | null } {
-  const entry = cache.get(key) as CacheEntry<T> | undefined;
-  if (!entry || entry.value === null || !entry.fetchedAt) return { fresh: null, stale: null };
+function getCached(key: string): { fresh: MineralRssResult<MineralRssArticle[]> | null; stale: MineralRssResult<MineralRssArticle[]> | null } {
+  const entry = cache.get(key);
+  if (!entry) return { fresh: null, stale: null };
   const now = Date.now();
-  const value = { data: entry.value, fetchedAt: entry.fetchedAt, isStale: now > entry.expiresAt };
-  if (now <= entry.expiresAt) return { fresh: value, stale: null };
-  if (now <= entry.staleUntil) return { fresh: null, stale: value };
+  if (now <= entry.expiresAt) return { fresh: { data: entry.value, fetchedAt: entry.fetchedAt, isStale: false }, stale: null };
+  if (now <= entry.staleUntil) return { fresh: null, stale: { data: entry.value, fetchedAt: entry.fetchedAt, isStale: true } };
   cache.delete(key);
   return { fresh: null, stale: null };
 }
 
-function setCached<T>(key: string, value: T | null, ttlMs: number, fetchedAt: string | null): void {
+function cacheSuccess(key: string, data: MineralRssArticle[]): MineralRssResult<MineralRssArticle[]> {
   const now = Date.now();
-  cache.set(key, { value, expiresAt: now + ttlMs, staleUntil: now + ttlMs + STALE_TTL_MS, fetchedAt });
+  const fetchedAt = new Date().toISOString();
+  cache.set(key, { value: data, expiresAt: now + RSS_CACHE_TTL_MS, staleUntil: now + RSS_CACHE_TTL_MS + STALE_TTL_MS, fetchedAt });
+  failureCacheUntil.delete(key);
+  return { data, fetchedAt, isStale: false };
 }
 
 async function requestArticles(): Promise<MineralRssArticle[] | null> {
@@ -120,33 +136,27 @@ async function requestArticles(): Promise<MineralRssArticle[] | null> {
     const response = await fetch(MINING_RSS_URL, {
       method: "GET",
       headers: {
-        Accept: "application/rss+xml, application/xml;q=0.9, text/xml;q=0.8",
+        Accept: "application/rss+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.5",
         "Accept-Language": "en-US,en;q=0.9",
-        "User-Agent": "JustinMacroReference/1.0 (+https://github.com/xu20007yahoocom-glitch/justin)"
+        "Cache-Control": "no-cache",
+        Referer: "https://www.mining.com/",
+        "User-Agent": "Mozilla/5.0 (compatible; JustinMacroReference/1.0; +https://github.com/xu20007yahoocom-glitch/justin)"
       },
       signal: controller.signal
     });
     const xml = await response.text();
-    if (!response.ok || !/<rss\b/i.test(xml)) {
-      console.warn("Mining.com RSS unavailable", {
-        endpoint: MINING_RSS_URL,
-        httpStatus: response.status,
-        contentType: response.headers.get("content-type"),
-        responsePreview: xml.slice(0, 300)
-      });
+    const contentType = response.headers.get("content-type") ?? null;
+    if (!response.ok) {
+      diagnostic({ endpoint: MINING_RSS_URL, outcome: response.status === 403 ? "http_403" : response.status === 429 ? "http_429" : response.status >= 500 ? "http_5xx" : "http_error", httpStatus: response.status, contentType, responseTextLength: xml.length, rawItemCount: 0, parsedCount: 0, filteredCount: 0, errorCategory: null });
       return null;
     }
-    const articles = parseArticles(xml);
-    if (articles.length === 0) {
-      console.info("Mining.com RSS returned no verifiable mineral articles", { endpoint: MINING_RSS_URL });
-      return null;
-    }
-    return articles;
+    const parsed = parseArticles(xml);
+    const outcome = parsed.rawItemCount === 0 ? "items_empty" : parsed.parsedCount === 0 ? "items_parse_filtered_empty" : parsed.filteredCount === 0 ? "items_keyword_filtered_empty" : "success";
+    diagnostic({ endpoint: MINING_RSS_URL, outcome, httpStatus: response.status, contentType, responseTextLength: xml.length, rawItemCount: parsed.rawItemCount, parsedCount: parsed.parsedCount, filteredCount: parsed.filteredCount, errorCategory: null });
+    return parsed.articles.length ? parsed.articles : null;
   } catch (error) {
-    console.warn("Mining.com RSS request failed", {
-      endpoint: MINING_RSS_URL,
-      reason: error instanceof Error ? error.message : String(error)
-    });
+    const errorCategory = error instanceof Error && error.name === "AbortError" ? "timeout" : "network_error";
+    diagnostic({ endpoint: MINING_RSS_URL, outcome: errorCategory, httpStatus: null, contentType: null, responseTextLength: 0, rawItemCount: 0, parsedCount: 0, filteredCount: 0, errorCategory });
     return null;
   } finally {
     clearTimeout(timeout);
@@ -155,27 +165,32 @@ async function requestArticles(): Promise<MineralRssArticle[] | null> {
 
 /**
  * Returns only linked Mining.com article metadata selected by local mineral keywords.
- * It does not infer production, reserve, price, or policy data from article titles.
+ * It never invents mining news or overwrites a recent successful cache with an empty refresh.
  */
 export async function getMiningComMineralNews(): Promise<MineralRssResult<MineralRssArticle[]> | null> {
-  const key = "mining-com:mineral-rss:v1";
-  const { fresh, stale } = getCached<MineralRssArticle[]>(key);
-  if (fresh) return fresh;
+  const key = "mining-com:mineral-rss:v2";
+  const { fresh, stale } = getCached(key);
+  if (fresh) {
+    diagnostic({ endpoint: MINING_RSS_URL, outcome: "success", cache: "fresh", httpStatus: null, contentType: null, responseTextLength: 0, rawItemCount: fresh.data.length, parsedCount: fresh.data.length, filteredCount: fresh.data.length, errorCategory: null });
+    return fresh;
+  }
+  if ((failureCacheUntil.get(key) ?? 0) > Date.now()) {
+    diagnostic({ endpoint: MINING_RSS_URL, outcome: "failure_short_cache", cache: "failure_short", httpStatus: null, contentType: null, responseTextLength: 0, rawItemCount: 0, parsedCount: 0, filteredCount: 0, errorCategory: "short_failure_cache" });
+    return stale;
+  }
   if (inFlight) return inFlight;
 
   inFlight = (async () => {
     try {
       const articles = await requestArticles();
       if (!articles) {
-        setCached(key, null, FAILURE_TTL_MS, null);
+        failureCacheUntil.set(key, Date.now() + FAILURE_TTL_MS);
         return stale;
       }
-      const fetchedAt = new Date().toISOString();
-      setCached(key, articles, RSS_CACHE_TTL_MS, fetchedAt);
-      return { data: articles, fetchedAt, isStale: false };
+      return cacheSuccess(key, articles);
     } catch (error) {
-      console.warn("Mining.com RSS fallback", { reason: error instanceof Error ? error.message : String(error) });
-      setCached(key, null, FAILURE_TTL_MS, null);
+      failureCacheUntil.set(key, Date.now() + FAILURE_TTL_MS);
+      diagnostic({ endpoint: MINING_RSS_URL, outcome: "network_error", httpStatus: null, contentType: null, responseTextLength: 0, rawItemCount: 0, parsedCount: 0, filteredCount: 0, errorCategory: error instanceof Error ? error.name : "unknown" });
       return stale;
     } finally {
       inFlight = null;
