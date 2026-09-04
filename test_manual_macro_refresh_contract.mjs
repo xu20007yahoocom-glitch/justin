@@ -20,7 +20,7 @@ const assertions = {
   backend_recognizes_refresh_parameter: macro.includes("function isRefreshRequest") && macro.includes('value === "1"'),
   backend_has_nine_second_limit: macro.includes("MANUAL_REFRESH_TIMEOUT_MS = 9_000"),
   backend_clears_wait_timer: macro.includes("clearTimeout(timer)"),
-  backend_single_flight: macro.includes("let manualRefreshInFlight") && macro.includes("if (manualRefreshInFlight) return manualRefreshInFlight"),
+  backend_single_flight: macro.includes("let manualRefreshInFlight") && macro.includes("if (manualRefreshInFlight) {") && macro.includes("return manualRefreshInFlight;"),
   backend_manual_response_is_not_cached: macro.includes('res.setHeader("Cache-Control", "private, no-store")'),
   backend_merges_previous_sections: macro.includes("function mergeWithPrevious") && macro.includes("mergeItemsWithPrevious") && macro.includes("mergeNewsSectionWithPrevious"),
   backend_forces_each_provider_cache_path: macro.includes('getFredLatestObservation("DCOILWTICO", { forceRefresh })') && macro.includes('getEiaCountryEnergy(definition, { forceRefresh })') && macro.includes('getGdeltRecentArticles("geopolitical", { forceRefresh })') && macro.includes('getMiningComMineralNews({ forceRefresh })'),

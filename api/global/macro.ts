@@ -376,7 +376,11 @@ function refreshStatus(value: GlobalMacroReference): "updated" | "partial" | "gd
 }
 
 function startManualRefresh(): Promise<GlobalMacroReference> {
-  if (manualRefreshInFlight) return manualRefreshInFlight;
+  if (manualRefreshInFlight) {
+    console.info("MACRO_MANUAL_REFRESH", { outcome: "joined_in_flight" });
+    return manualRefreshInFlight;
+  }
+  console.info("MACRO_MANUAL_REFRESH", { outcome: "started" });
   const operation = generateMacro(true);
   manualRefreshInFlight = operation.finally(() => { manualRefreshInFlight = null; });
   return manualRefreshInFlight;
@@ -408,6 +412,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse): 
       const refreshed = await waitForManualRefresh(startManualRefresh());
       const value = refreshed ?? previous ?? unavailable("正在刷新宏观数据；当前没有可用的历史缓存");
       const status = refreshed ? refreshStatus(refreshed) : previous ? "partial" : "unavailable";
+      console.info("MACRO_MANUAL_REFRESH", { outcome: refreshed ? "completed" : "timeout_fallback", status, timeoutMs: MANUAL_REFRESH_TIMEOUT_MS, usedPreviousCache: !refreshed && Boolean(previous) });
       res.setHeader("X-Macro-Refresh-Status", status);
       // Each manual request carries a nonce; no-store prevents a CDN/browser from preserving it.
       res.setHeader("Cache-Control", "private, no-store");
