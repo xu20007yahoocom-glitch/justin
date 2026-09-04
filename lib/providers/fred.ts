@@ -38,6 +38,11 @@ export interface FredResult<T> {
   isStale: boolean;
 }
 
+/** Cache-only control: does not alter FRED series discovery, IDs, values or units. */
+export interface FredRefreshOptions {
+  forceRefresh?: boolean;
+}
+
 export interface FredLatestObservation {
   seriesId: string;
   observationDate: string;
@@ -237,50 +242,52 @@ async function requestSearch(searchText: string): Promise<FredSeriesCandidate[] 
 }
 
 /** Values remain strings; callers must use units from FRED metadata rather than infer scale. */
-export async function getFredLatestObservation(seriesIdInput: string): Promise<FredResult<FredLatestObservation> | null> {
+export async function getFredLatestObservation(seriesIdInput: string, options: FredRefreshOptions = {}): Promise<FredResult<FredLatestObservation> | null> {
   const seriesId = seriesIdInput.trim().toUpperCase();
   if (!seriesId || !/^[A-Z0-9_\-]+$/.test(seriesId)) return null;
   const key = `fred:latest:${seriesId}`;
   const { fresh, stale } = getCache<FredLatestObservation>(key);
-  if (fresh) return fresh;
+  if (fresh && !options.forceRefresh) return fresh;
+  const fallback = stale ?? (fresh && options.forceRefresh ? { ...fresh, isStale: true } : null);
   const running = inFlight.get(key) as Promise<FredResult<FredLatestObservation> | null> | undefined;
   if (running) return running;
   const operation = (async (): Promise<FredResult<FredLatestObservation> | null> => {
     try {
       const data = await requestLatest(seriesId);
-      if (!data) { cacheValue(key, null, FAILURE_TTL_MS, null); return stale; }
+      if (!data) { if (!fallback) cacheValue(key, null, FAILURE_TTL_MS, null); return fallback; }
       const fetchedAt = new Date().toISOString();
       cacheValue(key, data, FRED_TTL_MS, fetchedAt);
       return { data, fetchedAt, isStale: false };
     } catch (error) {
       console.warn("FRED latest observation fallback", { seriesId, reason: error instanceof Error ? error.message : String(error) });
-      cacheValue(key, null, FAILURE_TTL_MS, null);
-      return stale;
+      if (!fallback) cacheValue(key, null, FAILURE_TTL_MS, null);
+      return fallback;
     } finally { inFlight.delete(key); }
   })();
   inFlight.set(key, operation as Promise<FredResult<unknown> | null>);
   return operation;
 }
 
-async function getFredSearchResults(searchText: string): Promise<FredResult<FredSeriesCandidate[]> | null> {
+async function getFredSearchResults(searchText: string, options: FredRefreshOptions = {}): Promise<FredResult<FredSeriesCandidate[]> | null> {
   const normalized = searchText.trim().replace(/\s+/g, " ").slice(0, 180);
   if (!normalized) return null;
   const key = `fred:search:${normalized.toLowerCase()}`;
   const { fresh, stale } = getCache<FredSeriesCandidate[]>(key);
-  if (fresh) return fresh;
+  if (fresh && !options.forceRefresh) return fresh;
+  const fallback = stale ?? (fresh && options.forceRefresh ? { ...fresh, isStale: true } : null);
   const running = inFlight.get(key) as Promise<FredResult<FredSeriesCandidate[]> | null> | undefined;
   if (running) return running;
   const operation = (async (): Promise<FredResult<FredSeriesCandidate[]> | null> => {
     try {
       const data = await requestSearch(normalized);
-      if (!data) { cacheValue(key, null, FAILURE_TTL_MS, null); return stale; }
+      if (!data) { if (!fallback) cacheValue(key, null, FAILURE_TTL_MS, null); return fallback; }
       const fetchedAt = new Date().toISOString();
       cacheValue(key, data, FRED_TTL_MS, fetchedAt);
       return { data, fetchedAt, isStale: false };
     } catch (error) {
       console.warn("FRED series discovery fallback", { endpoint: safeSearchEndpoint(normalized), reason: error instanceof Error ? error.message : String(error) });
-      cacheValue(key, null, FAILURE_TTL_MS, null);
-      return stale;
+      if (!fallback) cacheValue(key, null, FAILURE_TTL_MS, null);
+      return fallback;
     } finally { inFlight.delete(key); }
   })();
   inFlight.set(key, operation as Promise<FredResult<unknown> | null>);
@@ -296,25 +303,26 @@ function scoreCandidate(candidate: FredSeriesCandidate, terms: string[]): number
   return matched * 10 + unitScore + currentScore;
 }
 
-async function discoverRateMetric(definition: FredRateDefinition, kind: FredRateMetric["kind"]): Promise<FredResult<FredRateMetric> | null> {
+async function discoverRateMetric(definition: FredRateDefinition, kind: FredRateMetric["kind"], options: FredRefreshOptions = {}): Promise<FredResult<FredRateMetric> | null> {
   if (!hasApiKey()) return null;
   const key = `fred:rate-metric:${definition.country}:${kind}`;
   const { fresh, stale } = getCache<FredRateMetric>(key);
-  if (fresh) return fresh;
+  if (fresh && !options.forceRefresh) return fresh;
+  const fallback = stale ?? (fresh && options.forceRefresh ? { ...fresh, isStale: true } : null);
   const running = inFlight.get(key) as Promise<FredResult<FredRateMetric> | null> | undefined;
   if (running) return running;
   const operation = (async (): Promise<FredResult<FredRateMetric> | null> => {
     try {
       const searchText = kind === "policyRate" ? definition.policySearch : definition.yieldSearch;
       const terms = kind === "policyRate" ? definition.policyTerms : definition.yieldTerms;
-      const search = await getFredSearchResults(searchText);
-      if (!search) { cacheValue(key, null, FAILURE_TTL_MS, null); return stale; }
+      const search = await getFredSearchResults(searchText, options);
+      if (!search) { if (!fallback) cacheValue(key, null, FAILURE_TTL_MS, null); return fallback; }
       const ranked = [...search.data].map((candidate) => ({ candidate, score: scoreCandidate(candidate, terms) }))
         .filter((entry) => entry.score >= Math.max(10, terms.length * 5))
         .sort((left, right) => right.score - left.score)
         .slice(0, 5);
       for (const entry of ranked) {
-        const latest = await getFredLatestObservation(entry.candidate.seriesId);
+        const latest = await getFredLatestObservation(entry.candidate.seriesId, options);
         if (!latest) continue;
         const data: FredRateMetric = {
           kind,
@@ -330,12 +338,12 @@ async function discoverRateMetric(definition: FredRateDefinition, kind: FredRate
         cacheValue(key, data, FRED_TTL_MS, fetchedAt);
         return { data, fetchedAt, isStale: latest.isStale || search.isStale };
       }
-      cacheValue(key, null, FAILURE_TTL_MS, null);
-      return stale;
+      if (!fallback) cacheValue(key, null, FAILURE_TTL_MS, null);
+      return fallback;
     } catch (error) {
       console.warn("FRED dynamic rate discovery fallback", { country: definition.country, kind, reason: error instanceof Error ? error.message : String(error) });
-      cacheValue(key, null, FAILURE_TTL_MS, null);
-      return stale;
+      if (!fallback) cacheValue(key, null, FAILURE_TTL_MS, null);
+      return fallback;
     } finally { inFlight.delete(key); }
   })();
   inFlight.set(key, operation as Promise<FredResult<unknown> | null>);
@@ -347,28 +355,29 @@ async function discoverRateMetric(definition: FredRateDefinition, kind: FredRate
  * 10-year yield. A missing key, unsuitable title, empty observation or any HTTP
  * failure returns null for that metric; no numeric fallback is produced.
  */
-export async function getFredCountryRate(definition: FredRateDefinition): Promise<FredResult<FredCountryRate> | null> {
+export async function getFredCountryRate(definition: FredRateDefinition, options: FredRefreshOptions = {}): Promise<FredResult<FredCountryRate> | null> {
   if (!hasApiKey()) return null;
   const key = `fred:country-rate:${definition.country}`;
   const { fresh, stale } = getCache<FredCountryRate>(key);
-  if (fresh) return fresh;
+  if (fresh && !options.forceRefresh) return fresh;
+  const fallback = stale ?? (fresh && options.forceRefresh ? { ...fresh, isStale: true } : null);
   const running = inFlight.get(key) as Promise<FredResult<FredCountryRate> | null> | undefined;
   if (running) return running;
   const operation = (async (): Promise<FredResult<FredCountryRate> | null> => {
     try {
       const [policyRate, tenYearYield] = await Promise.all([
-        discoverRateMetric(definition, "policyRate"),
-        discoverRateMetric(definition, "tenYearYield")
+        discoverRateMetric(definition, "policyRate", options),
+        discoverRateMetric(definition, "tenYearYield", options)
       ]);
-      if (!policyRate && !tenYearYield) { cacheValue(key, null, FAILURE_TTL_MS, null); return stale; }
+      if (!policyRate && !tenYearYield) { if (!fallback) cacheValue(key, null, FAILURE_TTL_MS, null); return fallback; }
       const fetchedAt = [policyRate?.fetchedAt, tenYearYield?.fetchedAt].filter((value): value is string => Boolean(value)).sort().at(-1) ?? new Date().toISOString();
       const data: FredCountryRate = { country: definition.country, policyRate: policyRate?.data ?? null, tenYearYield: tenYearYield?.data ?? null };
       cacheValue(key, data, FRED_TTL_MS, fetchedAt);
       return { data, fetchedAt, isStale: Boolean(policyRate?.isStale || tenYearYield?.isStale) };
     } catch (error) {
       console.warn("FRED country rate fallback", { country: definition.country, reason: error instanceof Error ? error.message : String(error) });
-      cacheValue(key, null, FAILURE_TTL_MS, null);
-      return stale;
+      if (!fallback) cacheValue(key, null, FAILURE_TTL_MS, null);
+      return fallback;
     } finally { inFlight.delete(key); }
   })();
   inFlight.set(key, operation as Promise<FredResult<unknown> | null>);

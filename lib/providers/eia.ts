@@ -36,6 +36,11 @@ export interface EiaResult<T> {
   isStale: boolean;
 }
 
+/** Cache-only control: does not alter fixed facets, country IDs, values or units. */
+export interface EiaRefreshOptions {
+  forceRefresh?: boolean;
+}
+
 export interface EiaInternationalQuery {
   activityId: string;
   productId: string;
@@ -229,7 +234,7 @@ async function requestLatest(query: EiaInternationalQuery): Promise<EiaInternati
 }
 
 /** Retrieves one latest observation while preserving the source's original unit and time period. */
-export async function getEiaInternationalLatest(queryInput: EiaInternationalQuery): Promise<EiaResult<EiaInternationalObservation> | null> {
+export async function getEiaInternationalLatest(queryInput: EiaInternationalQuery, options: EiaRefreshOptions = {}): Promise<EiaResult<EiaInternationalObservation> | null> {
   const frequency = queryInput.frequency === "monthly" ? "monthly" : "annual";
   const query: EiaInternationalQuery = {
     activityId: safeFacet(queryInput.activityId) ?? "",
@@ -241,23 +246,24 @@ export async function getEiaInternationalLatest(queryInput: EiaInternationalQuer
   if (!query.activityId || !query.productId || !query.countryRegionId) return null;
   const key = `eia:intl:${query.frequency}:${query.activityId}:${query.productId}:${query.countryRegionId}:${query.unit ?? "any"}`;
   const { fresh, stale } = getCache<EiaInternationalObservation>(key);
-  if (fresh) return fresh;
+  if (fresh && !options.forceRefresh) return fresh;
+  const fallback = stale ?? (fresh && options.forceRefresh ? { ...fresh, isStale: true } : null);
   const running = inFlight.get(key) as Promise<EiaResult<EiaInternationalObservation> | null> | undefined;
   if (running) return running;
   const operation = (async (): Promise<EiaResult<EiaInternationalObservation> | null> => {
     try {
       const data = await requestLatest(query);
       if (!data) {
-        cacheValue(key, null, FAILURE_TTL_MS, null);
-        return stale;
+        if (!fallback) cacheValue(key, null, FAILURE_TTL_MS, null);
+        return fallback;
       }
       const fetchedAt = new Date().toISOString();
       cacheValue(key, data, EIA_TTL_MS, fetchedAt);
       return { data, fetchedAt, isStale: false };
     } catch (error) {
       console.warn("EIA International fallback", { endpoint: safeEndpoint(query), reason: error instanceof Error ? error.message : String(error) });
-      cacheValue(key, null, FAILURE_TTL_MS, null);
-      return stale;
+      if (!fallback) cacheValue(key, null, FAILURE_TTL_MS, null);
+      return fallback;
     } finally {
       inFlight.delete(key);
     }
@@ -266,10 +272,11 @@ export async function getEiaInternationalLatest(queryInput: EiaInternationalQuer
   return operation;
 }
 
-async function fixedEnergyMetric(country: EiaCountryDefinition, definition: FixedEiaEnergyDefinition): Promise<EiaResult<EiaEnergyMetric> | null> {
+async function fixedEnergyMetric(country: EiaCountryDefinition, definition: FixedEiaEnergyDefinition, options: EiaRefreshOptions = {}): Promise<EiaResult<EiaEnergyMetric> | null> {
   const key = `eia:intl:fixed:${country.countryRegionId}:${definition.id}`;
   const { fresh, stale } = getCache<EiaEnergyMetric>(key);
-  if (fresh) return fresh;
+  if (fresh && !options.forceRefresh) return fresh;
+  const fallback = stale ?? (fresh && options.forceRefresh ? { ...fresh, isStale: true } : null);
   const running = inFlight.get(key) as Promise<EiaResult<EiaEnergyMetric> | null> | undefined;
   if (running) return running;
   const operation = (async (): Promise<EiaResult<EiaEnergyMetric> | null> => {
@@ -279,7 +286,7 @@ async function fixedEnergyMetric(country: EiaCountryDefinition, definition: Fixe
         productId: definition.productId,
         countryRegionId: country.countryRegionId,
         frequency: definition.frequency
-      });
+      }, options);
       if (!observation) {
         console.info("EIA International fixed metric unavailable", {
           country: country.country,
@@ -288,8 +295,8 @@ async function fixedEnergyMetric(country: EiaCountryDefinition, definition: Fixe
           productId: definition.productId,
           frequency: definition.frequency
         });
-        cacheValue(key, null, FAILURE_TTL_MS, null);
-        return stale;
+        if (!fallback) cacheValue(key, null, FAILURE_TTL_MS, null);
+        return fallback;
       }
       const data: EiaEnergyMetric = {
         id: definition.id,
@@ -310,8 +317,8 @@ async function fixedEnergyMetric(country: EiaCountryDefinition, definition: Fixe
         productId: definition.productId,
         reason: error instanceof Error ? error.message : String(error)
       });
-      cacheValue(key, null, FAILURE_TTL_MS, null);
-      return stale;
+      if (!fallback) cacheValue(key, null, FAILURE_TTL_MS, null);
+      return fallback;
     } finally {
       inFlight.delete(key);
     }
@@ -324,20 +331,21 @@ async function fixedEnergyMetric(country: EiaCountryDefinition, definition: Fixe
  * Queries five official fixed International facet combinations for one country.
  * A missing country/metric is omitted and the API consumer renders it as “暂无可靠资料”.
  */
-export async function getEiaCountryEnergy(country: EiaCountryDefinition): Promise<EiaResult<EiaCountryEnergy> | null> {
+export async function getEiaCountryEnergy(country: EiaCountryDefinition, options: EiaRefreshOptions = {}): Promise<EiaResult<EiaCountryEnergy> | null> {
   if (!process.env.EIA_API_KEY?.trim()) return null;
   const key = `eia:intl:country-energy-fixed:${country.countryRegionId}`;
   const { fresh, stale } = getCache<EiaCountryEnergy>(key);
-  if (fresh) return fresh;
+  if (fresh && !options.forceRefresh) return fresh;
+  const fallback = stale ?? (fresh && options.forceRefresh ? { ...fresh, isStale: true } : null);
   const running = inFlight.get(key) as Promise<EiaResult<EiaCountryEnergy> | null> | undefined;
   if (running) return running;
   const operation = (async (): Promise<EiaResult<EiaCountryEnergy> | null> => {
     try {
-      const results = await Promise.all(FIXED_ENERGY_DEFINITIONS.map((definition) => fixedEnergyMetric(country, definition)));
+      const results = await Promise.all(FIXED_ENERGY_DEFINITIONS.map((definition) => fixedEnergyMetric(country, definition, options)));
       const metrics = results.flatMap((result) => result ? [result.data] : []);
       if (metrics.length === 0) {
-        cacheValue(key, null, FAILURE_TTL_MS, null);
-        return stale;
+        if (!fallback) cacheValue(key, null, FAILURE_TTL_MS, null);
+        return fallback;
       }
       const fetchedAt = results.map((result) => result?.fetchedAt).filter((value): value is string => Boolean(value)).sort().at(-1) ?? new Date().toISOString();
       const data: EiaCountryEnergy = { country: country.country, countryRegionId: country.countryRegionId, metrics };
@@ -345,8 +353,8 @@ export async function getEiaCountryEnergy(country: EiaCountryDefinition): Promis
       return { data, fetchedAt, isStale: results.some((result) => result?.isStale) };
     } catch (error) {
       console.warn("EIA International country fixed fallback", { country: country.country, reason: error instanceof Error ? error.message : String(error) });
-      cacheValue(key, null, FAILURE_TTL_MS, null);
-      return stale;
+      if (!fallback) cacheValue(key, null, FAILURE_TTL_MS, null);
+      return fallback;
     } finally {
       inFlight.delete(key);
     }

@@ -184,6 +184,8 @@ export interface GlobalMacroSource {
 }
 
 /** 单条数据从不使用估算值或占位数字；不可用时 value 固定为“暂无可靠资料”。 */
+export type GlobalMacroCacheStatus = "fresh" | "stale" | "stale_refreshing" | "stale_cooldown" | "unavailable_refreshing" | "unavailable_cooldown";
+
 export interface GlobalMacroItem {
   label: string;
   value: string;
@@ -191,6 +193,9 @@ export interface GlobalMacroItem {
   dataTime: string | null;
   source: GlobalMacroSource | null;
   note: string;
+  /** Provider cache metadata; dataTime remains the source observation/article time. */
+  cacheUpdatedAt?: string | null;
+  cacheStatus?: GlobalMacroCacheStatus;
   available: boolean;
 }
 

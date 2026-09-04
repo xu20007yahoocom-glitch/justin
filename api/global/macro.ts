@@ -36,6 +36,8 @@ interface CachedMacro {
 }
 
 let macroCache: CachedMacro | null = null;
+let manualRefreshInFlight: Promise<GlobalMacroReference> | null = null;
+const MANUAL_REFRESH_TIMEOUT_MS = 9_000;
 
 function dedupeSources(sources: Array<GlobalMacroSource | null>): GlobalMacroSource[] {
   const seen = new Set<string>();
@@ -143,22 +145,28 @@ function gdeltItems(label: string, result: GdeltResult<GdeltArticle[]> | null): 
         ? "正在使用缓存资料，后台刷新中；"
         : "";
   if (!result || result.data.length === 0) {
-    return [unavailableItem(label, "GDELT", "GDELT DOC 2.0", "https://api.gdeltproject.org/api/v2/doc/doc", `${errorCategory}${result?.cacheStatus === "unavailable_cooldown" ? "来源暂时受限；" : ""}GDELT 未返回可验证新闻；非实时，定期更新`)];
+    const item = unavailableItem(label, "GDELT", "GDELT DOC 2.0", "https://api.gdeltproject.org/api/v2/doc/doc", `${errorCategory}${result?.cacheStatus === "unavailable_cooldown" ? "来源暂时受限；" : ""}GDELT 未返回可验证新闻；非实时，定期更新`);
+    return [{ ...item, cacheUpdatedAt: result?.fetchedAt ?? null, cacheStatus: result?.cacheStatus }];
   }
   const transport = result.sourceFormat === "rss" ? "GDELT RSS fallback" : "GDELT JSON";
   return result.data.map((article) => ({
     label: article.title, value: article.domain ? `新闻来源：${article.domain}` : "新闻来源链接可用", unit: null, dataTime: article.seenAt,
     source: { provider: "GDELT", title: article.title, url: article.url, dataTime: article.seenAt },
-    note: `类别：${label}；${cacheNotice}${result.isStale ? "服务端旧缓存；" : ""}${transport} 新闻索引，非实时，定期更新`, available: true
+    note: `类别：${label}；${cacheNotice}${result.isStale ? "服务端旧缓存；" : ""}${transport} 新闻索引，非实时，定期更新`,
+    cacheUpdatedAt: result.fetchedAt, cacheStatus: result.cacheStatus, available: true
   }));
 }
 
 function mineralNewsItems(result: MineralRssResult<MineralRssArticle[]> | null): GlobalMacroItem[] {
-  if (!result) return [unavailableItem("近期矿产新闻", "Mining.com", "Mining.com RSS", MINING_RSS_URL, "Mining.com RSS 未返回可验证矿产新闻；非实时，定期更新")];
+  if (!result || result.data.length === 0) {
+    const item = unavailableItem("近期矿产新闻", "Mining.com", "Mining.com RSS", MINING_RSS_URL, "Mining.com RSS 未返回可验证矿产新闻；非实时，定期更新");
+    return [{ ...item, cacheUpdatedAt: result?.fetchedAt ?? null, cacheStatus: result?.isStale ? "stale" : undefined }];
+  }
   return result.data.map((article) => ({
     label: article.title, value: "新闻来源：Mining.com", unit: null, dataTime: article.publishedAt,
     source: { provider: "Mining.com", title: article.title, url: article.url, dataTime: article.publishedAt },
-    note: `${result.isStale ? "服务端缓存可能过期；" : ""}Mining.com RSS 本地矿产关键词筛选；非实时，定期更新`, available: true
+    note: `${result.isStale ? "服务端缓存可能过期；" : ""}Mining.com RSS 本地矿产关键词筛选；非实时，定期更新`,
+    cacheUpdatedAt: result.fetchedAt, cacheStatus: result.isStale ? "stale" : "fresh", available: true
   }));
 }
 
@@ -208,6 +216,75 @@ function unavailable(reason: string): GlobalMacroReference {
   };
 }
 
+function mergeItemsWithPrevious(previous: GlobalMacroItem[], current: GlobalMacroItem[]): { items: GlobalMacroItem[]; retained: boolean } {
+  const previousAvailable = new Map(previous.filter((item) => item.available).map((item) => [item.label, item]));
+  let retained = false;
+  const items = current.map((item) => {
+    const fallback = !item.available ? previousAvailable.get(item.label) : undefined;
+    if (!fallback) return item;
+    retained = true;
+    return fallback;
+  });
+  return { items, retained };
+}
+
+function mergeCountrySectionWithPrevious(previous: GlobalMacroSection, current: GlobalMacroSection): { section: GlobalMacroSection; retained: boolean } {
+  const previousGroups = new Map((previous.countries ?? []).map((group) => [group.country, group]));
+  let retained = false;
+  const countries = (current.countries ?? []).map((group) => {
+    const earlier = previousGroups.get(group.country);
+    if (!earlier) return group;
+    const merged = mergeItemsWithPrevious(earlier.items, group.items);
+    retained ||= merged.retained;
+    const updatedAt = merged.items.filter((item) => item.available).map((item) => item.dataTime).filter((value): value is string => Boolean(value)).sort().at(-1) ?? null;
+    return { ...group, items: merged.items, updatedAt, available: merged.items.some((item) => item.available) };
+  });
+  return { section: countrySection(current.title, countries, current.summary), retained };
+}
+
+function newsCategory(item: GlobalMacroItem): string | null {
+  if (item.label === "地缘政治新闻" || item.note.includes("类别：地缘政治新闻")) return "geopolitical";
+  if (item.label === "经济相关新闻" || item.note.includes("类别：经济相关新闻")) return "economic";
+  return null;
+}
+
+function mergeNewsSectionWithPrevious(previous: GlobalMacroSection, current: GlobalMacroSection): { section: GlobalMacroSection; retained: boolean } {
+  const output: GlobalMacroItem[] = [];
+  let retained = false;
+  for (const category of ["geopolitical", "economic"]) {
+    const currentItems = current.items.filter((item) => newsCategory(item) === category);
+    const previousItems = previous.items.filter((item) => newsCategory(item) === category && item.available);
+    if (!currentItems.some((item) => item.available) && previousItems.length > 0) {
+      output.push(...previousItems);
+      retained = true;
+    } else {
+      output.push(...currentItems);
+    }
+  }
+  const unknown = current.items.filter((item) => !newsCategory(item));
+  output.push(...unknown);
+  return { section: section(current.title, output, current.summary), retained };
+}
+
+function mergeWithPrevious(previous: GlobalMacroReference, current: GlobalMacroReference): GlobalMacroReference {
+  const energy = mergeItemsWithPrevious(previous.energyPrices.items, current.energyPrices.items);
+  const energyPrices = section(current.energyPrices.title, energy.items, current.energyPrices.summary);
+  const centralBank = mergeCountrySectionWithPrevious(previous.centralBankRates, current.centralBankRates);
+  const countryEnergy = mergeCountrySectionWithPrevious(previous.countryEnergy, current.countryEnergy);
+  const geopolitical = mergeNewsSectionWithPrevious(previous.geopoliticalNews, current.geopoliticalNews);
+  const miningNews = mergeItemsWithPrevious(previous.criticalMinerals.news, current.criticalMinerals.news);
+  const criticalMinerals: CriticalMineralsSection = {
+    ...current.criticalMinerals,
+    news: miningNews.items,
+    updatedAt: miningNews.retained ? previous.criticalMinerals.updatedAt : current.criticalMinerals.updatedAt,
+    sources: dedupeSources([...current.criticalMinerals.minerals.map((mineral) => mineral.source), ...miningNews.items.map((item) => item.source)])
+  };
+  const retained = energy.retained || centralBank.retained || countryEnergy.retained || geopolitical.retained || miningNews.retained;
+  const sources = dedupeSources([...criticalMinerals.sources, ...current.preciousMetals.sources, ...energyPrices.sources, ...countryEnergy.section.sources, ...centralBank.section.sources, ...geopolitical.section.sources]);
+  const available = criticalMinerals.minerals.some((mineral) => mineral.available) || [...criticalMinerals.news, ...current.preciousMetals.items, ...energyPrices.items, ...(countryEnergy.section.countries ?? []).flatMap((country) => country.items), ...(centralBank.section.countries ?? []).flatMap((country) => country.items), ...geopolitical.section.items].some((item) => item.available);
+  return { ...current, available, sources, criticalMinerals, energyPrices, countryEnergy: countryEnergy.section, centralBankRates: centralBank.section, geopoliticalNews: geopolitical.section, isStale: current.isStale || retained };
+}
+
 async function mapWithConcurrency<T, R>(values: readonly T[], limit: number, mapper: (value: T) => Promise<R>): Promise<R[]> {
   const results: R[] = new Array(values.length);
   let cursor = 0;
@@ -223,19 +300,19 @@ async function mapWithConcurrency<T, R>(values: readonly T[], limit: number, map
   return results;
 }
 
-async function generateMacro(): Promise<GlobalMacroReference> {
+async function generateMacro(forceRefresh = false): Promise<GlobalMacroReference> {
   try {
     const newsPromise = Promise.allSettled([
-      getGdeltRecentArticles("geopolitical"),
-      getGdeltRecentArticles("economic"),
-      getMiningComMineralNews()
+      getGdeltRecentArticles("geopolitical", { forceRefresh }),
+      getGdeltRecentArticles("economic", { forceRefresh }),
+      getMiningComMineralNews({ forceRefresh })
     ]);
     const [wti, brent, henryHub, rateResults, energyResults] = await Promise.all([
-      getFredLatestObservation("DCOILWTICO"),
-      getFredLatestObservation("POILBREUSDM"),
-      getFredLatestObservation("DHHNGSP"),
-      mapWithConcurrency(FRED_MAJOR_RATE_DEFINITIONS, 2, (definition) => getFredCountryRate(definition)),
-      mapWithConcurrency(EIA_MAJOR_ENERGY_COUNTRIES, 1, (definition) => getEiaCountryEnergy(definition))
+      getFredLatestObservation("DCOILWTICO", { forceRefresh }),
+      getFredLatestObservation("POILBREUSDM", { forceRefresh }),
+      getFredLatestObservation("DHHNGSP", { forceRefresh }),
+      mapWithConcurrency(FRED_MAJOR_RATE_DEFINITIONS, 2, (definition) => getFredCountryRate(definition, { forceRefresh })),
+      mapWithConcurrency(EIA_MAJOR_ENERGY_COUNTRIES, 1, (definition) => getEiaCountryEnergy(definition, { forceRefresh }))
     ]);
     const [geopoliticalSettled, economicSettled, mineralSettled] = await newsPromise;
     const geopolitical = geopoliticalSettled.status === "fulfilled" ? geopoliticalSettled.value : null;
@@ -274,17 +351,69 @@ async function generateMacro(): Promise<GlobalMacroReference> {
     const cacheTtl = hasNews(geopolitical) && hasNews(economicNews) && hasNews(mineralNews) && !value.isStale
       ? MACRO_CACHE_TTL_MS
       : MACRO_NEWS_RETRY_TTL_MS;
-    macroCache = { value, expiresAt: Date.now() + cacheTtl };
-    return value;
+    const mergedValue = forceRefresh && macroCache?.value ? mergeWithPrevious(macroCache.value, value) : value;
+    macroCache = { value: mergedValue, expiresAt: Date.now() + cacheTtl };
+    return mergedValue;
   } catch (error) {
     console.error("Global macro real-data assembly failed; returning null-safe fallback", error instanceof Error ? error.message : String(error));
+    // A forced refresh must never replace a working macro cache with an all-empty response.
+    if (forceRefresh && macroCache?.value) return { ...macroCache.value, isStale: true };
     return unavailable("全球宏观数据暂时不可用，请稍后再试");
   }
+}
+
+function hasGdeltCooldown(value: GlobalMacroReference): boolean {
+  return value.geopoliticalNews.items.some((item) => item.note.includes("来源暂时受限"));
+}
+
+function refreshStatus(value: GlobalMacroReference): "updated" | "partial" | "gdelt_cooldown" {
+  if (hasGdeltCooldown(value)) return "gdelt_cooldown";
+  // Gold is intentionally unavailable because the prior FRED LMBA series was removed;
+  // it must not make every otherwise successful manual refresh appear partial.
+  const sections = [value.energyPrices, value.countryEnergy, value.centralBankRates, value.geopoliticalNews];
+  const incomplete = sections.some((entry) => entry.items.some((item) => !item.available)) || value.isStale;
+  return incomplete ? "partial" : "updated";
+}
+
+function startManualRefresh(): Promise<GlobalMacroReference> {
+  if (manualRefreshInFlight) return manualRefreshInFlight;
+  const operation = generateMacro(true);
+  manualRefreshInFlight = operation.finally(() => { manualRefreshInFlight = null; });
+  return manualRefreshInFlight;
+}
+
+function waitForManualRefresh(operation: Promise<GlobalMacroReference>): Promise<GlobalMacroReference | null> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(null), MANUAL_REFRESH_TIMEOUT_MS);
+    void operation.then((value) => {
+      clearTimeout(timer);
+      resolve(value);
+    }, () => {
+      clearTimeout(timer);
+      resolve(null);
+    });
+  });
+}
+
+function isRefreshRequest(req: VercelRequest): boolean {
+  const value = req.query?.refresh;
+  return value === "1" || (Array.isArray(value) && value.includes("1"));
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse): Promise<void> {
   if (req.method !== "GET") { res.status(405).json({ error: "Method not allowed" }); return; }
   try {
+    if (isRefreshRequest(req)) {
+      const previous = macroCache?.value ?? null;
+      const refreshed = await waitForManualRefresh(startManualRefresh());
+      const value = refreshed ?? previous ?? unavailable("正在刷新宏观数据；当前没有可用的历史缓存");
+      const status = refreshed ? refreshStatus(refreshed) : previous ? "partial" : "unavailable";
+      res.setHeader("X-Macro-Refresh-Status", status);
+      // Each manual request carries a nonce; no-store prevents a CDN/browser from preserving it.
+      res.setHeader("Cache-Control", "private, no-store");
+      res.status(200).json(value);
+      return;
+    }
     if (macroCache && macroCache.expiresAt > Date.now()) {
       res.setHeader("Cache-Control", macroResponseCacheControl(macroCache.value));
       res.status(200).json({ ...macroCache.value, cachedAt: macroCache.value.generatedAt });
@@ -296,6 +425,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse): 
   } catch (error) {
     console.error("Global macro handler failed; returning null-safe fallback", error instanceof Error ? error.message : String(error));
     res.setHeader("Cache-Control", "no-store");
+    res.setHeader("X-Macro-Refresh-Status", "unavailable");
     res.status(200).json(unavailable("全球宏观数据暂时不可用，请稍后再试"));
   }
 }

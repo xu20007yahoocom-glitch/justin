@@ -69,6 +69,11 @@ export interface GdeltResult<T> {
   errorCategory: GdeltOutcome | null;
 }
 
+/** Cache-only control: force refresh never clears last-known-good articles or bypasses cooldown. */
+export interface GdeltRefreshOptions {
+  forceRefresh?: boolean;
+}
+
 export interface GdeltArticle {
   title: string;
   url: string;
@@ -246,6 +251,14 @@ async function requestAttempt(category: GdeltNewsCategory, sourceFormat: GdeltSo
   const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   const base = { category, query: CATEGORY_QUERY[category], sourceFormat, requestUrl: url.toString(), attempt, timeoutMs: REQUEST_TIMEOUT_MS, rateLimitWaitMs };
 
+  // Another queued category may have received Retry-After while this request waited.
+  // Do not send a new JSON or RSS request until that provider-level cooldown expires.
+  if (Date.now() < providerCooldownUntil) {
+    clearTimeout(timeout);
+    diagnostic({ ...base, outcome: "rate_limited_content", httpStatus: null, contentType: null, responseTextLength: 0, topLevelFields: [], articlesIsArray: false, rawArticleCount: 0, filteredArticleCount: 0, cooldownUntil: providerCooldownUntil, errorCategory: "rate_limited_content" });
+    return { articles: null, retryOnTimeout: false, allowRssFallback: false, sourceFormat, outcome: "rate_limited_content", cooldownMs: providerCooldownUntil - Date.now() };
+  }
+
   try {
     const response = await fetch(url.toString(), {
       method: "GET",
@@ -344,23 +357,26 @@ function startRefresh(key: string, category: GdeltNewsCategory): void {
  * best-effort background refresh.  With no historical success, it returns a structured empty
  * result immediately and starts one background request; it never synthesizes news.
  */
-export async function getGdeltRecentArticles(category: GdeltNewsCategory): Promise<GdeltResult<GdeltArticle[]> | null> {
+export async function getGdeltRecentArticles(category: GdeltNewsCategory, options: GdeltRefreshOptions = {}): Promise<GdeltResult<GdeltArticle[]> | null> {
   const key = `gdelt:doc:${category}:${CATEGORY_QUERY[category]}`;
   const { fresh, stale } = readCache(key);
-  if (fresh) {
+  if (fresh && !options.forceRefresh) {
     diagnostic({ category, query: CATEGORY_QUERY[category], sourceFormat: fresh.sourceFormat, requestUrl: buildUrl(category, fresh.sourceFormat).toString(), attempt: 0, outcome: "success", cache: "fresh", timeoutMs: REQUEST_TIMEOUT_MS, httpStatus: null, contentType: null, responseTextLength: 0, topLevelFields: [], articlesIsArray: fresh.sourceFormat === "json", rawArticleCount: fresh.data.length, filteredArticleCount: fresh.data.length, errorCategory: null });
     return fresh;
   }
 
+  // A forced refresh treats otherwise fresh data as immediately displayable stale data.
+  // The refresh itself remains deduplicated and cannot bypass a provider cooldown.
+  const reusableEntry = stale ?? (options.forceRefresh ? cache.get(key) ?? null : null);
   const failure = failureCache.get(key);
   const now = Date.now();
   const inCooldown = now < providerCooldownUntil || (failure?.until ?? 0) > now;
-  if (stale) {
+  if (reusableEntry) {
     const error = failure?.outcome ?? null;
     const status: GdeltCacheStatus = inCooldown ? "stale_cooldown" : "stale_refreshing";
     if (!inCooldown) startRefresh(key, category);
-    diagnostic({ category, query: CATEGORY_QUERY[category], sourceFormat: stale.sourceFormat, requestUrl: buildUrl(category, stale.sourceFormat).toString(), attempt: 0, outcome: error ?? "success", cache: status, timeoutMs: REQUEST_TIMEOUT_MS, staleUntil: stale.staleUntil, cooldownUntil: providerCooldownUntil || null, httpStatus: null, contentType: null, responseTextLength: 0, topLevelFields: [], articlesIsArray: stale.sourceFormat === "json", rawArticleCount: stale.value.length, filteredArticleCount: stale.value.length, errorCategory: error });
-    return cachedResult(stale, status, error);
+    diagnostic({ category, query: CATEGORY_QUERY[category], sourceFormat: reusableEntry.sourceFormat, requestUrl: buildUrl(category, reusableEntry.sourceFormat).toString(), attempt: 0, outcome: error ?? "success", cache: status, forcedRefresh: Boolean(options.forceRefresh), timeoutMs: REQUEST_TIMEOUT_MS, staleUntil: reusableEntry.staleUntil, cooldownUntil: providerCooldownUntil || null, httpStatus: null, contentType: null, responseTextLength: 0, topLevelFields: [], articlesIsArray: reusableEntry.sourceFormat === "json", rawArticleCount: reusableEntry.value.length, filteredArticleCount: reusableEntry.value.length, errorCategory: error });
+    return cachedResult(reusableEntry, status, error);
   }
 
   const outcome = failure?.outcome ?? (inCooldown ? "rate_limited_content" : "refresh_started");

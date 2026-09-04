@@ -32,6 +32,11 @@ export interface MineralRssResult<T> {
   isStale: boolean;
 }
 
+/** Cache-only control: does not alter Mining.com feed, parsing or keyword filtering. */
+export interface MineralRssRefreshOptions {
+  forceRefresh?: boolean;
+}
+
 interface ParseResult {
   rawItemCount: number;
   parsedCount: number;
@@ -167,16 +172,17 @@ async function requestArticles(): Promise<MineralRssArticle[] | null> {
  * Returns only linked Mining.com article metadata selected by local mineral keywords.
  * It never invents mining news or overwrites a recent successful cache with an empty refresh.
  */
-export async function getMiningComMineralNews(): Promise<MineralRssResult<MineralRssArticle[]> | null> {
+export async function getMiningComMineralNews(options: MineralRssRefreshOptions = {}): Promise<MineralRssResult<MineralRssArticle[]> | null> {
   const key = "mining-com:mineral-rss:v2";
   const { fresh, stale } = getCached(key);
-  if (fresh) {
+  if (fresh && !options.forceRefresh) {
     diagnostic({ endpoint: MINING_RSS_URL, outcome: "success", cache: "fresh", httpStatus: null, contentType: null, responseTextLength: 0, rawItemCount: fresh.data.length, parsedCount: fresh.data.length, filteredCount: fresh.data.length, errorCategory: null });
     return fresh;
   }
+  const fallback = stale ?? (fresh && options.forceRefresh ? { ...fresh, isStale: true } : null);
   if ((failureCacheUntil.get(key) ?? 0) > Date.now()) {
     diagnostic({ endpoint: MINING_RSS_URL, outcome: "failure_short_cache", cache: "failure_short", httpStatus: null, contentType: null, responseTextLength: 0, rawItemCount: 0, parsedCount: 0, filteredCount: 0, errorCategory: "short_failure_cache" });
-    return stale;
+    return fallback;
   }
   if (inFlight) return inFlight;
 
@@ -185,13 +191,13 @@ export async function getMiningComMineralNews(): Promise<MineralRssResult<Minera
       const articles = await requestArticles();
       if (!articles) {
         failureCacheUntil.set(key, Date.now() + FAILURE_TTL_MS);
-        return stale;
+        return fallback;
       }
       return cacheSuccess(key, articles);
     } catch (error) {
       failureCacheUntil.set(key, Date.now() + FAILURE_TTL_MS);
       diagnostic({ endpoint: MINING_RSS_URL, outcome: "network_error", httpStatus: null, contentType: null, responseTextLength: 0, rawItemCount: 0, parsedCount: 0, filteredCount: 0, errorCategory: error instanceof Error ? error.name : "unknown" });
-      return stale;
+      return fallback;
     } finally {
       inFlight = null;
     }
