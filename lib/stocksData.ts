@@ -5,18 +5,42 @@
  */
 import type { StockQuote, HistoricalDataPoint } from "../src/types.js";
 
-export const STOCKS_METADATA: Record<string, { companyName: string; fallbackPrice: number }> = {
+export interface StockMetadata {
+  companyName: string;
+  /** Optional legacy-only fallback for symbols that predate strict no-fabrication handling. */
+  fallbackPrice?: number;
+  displayName?: string;
+  chineseName?: string;
+  exchange?: string;
+  sector?: string;
+  industry?: string;
+  companyType?: "downstream_refiner";
+}
+
+export const STOCKS_METADATA: Record<string, StockMetadata> = {
   UGI: { companyName: "UGI Corporation", fallbackPrice: 24.50 },
   LNG: { companyName: "Cheniere Energy, Inc.", fallbackPrice: 178.20 },
   DXCM: { companyName: "Dexcom, Inc.", fallbackPrice: 88.40 },
-  PTEN: { companyName: "Patterson-UTI Energy, Inc.", fallbackPrice: 10.25 }
+  PTEN: { companyName: "Patterson-UTI Energy, Inc.", fallbackPrice: 10.25 },
+  MPC: {
+    companyName: "Marathon Petroleum Corporation",
+    displayName: "Marathon Petroleum Corporation",
+    chineseName: "马拉松石油",
+    exchange: "NYSE",
+    sector: "Energy",
+    industry: "Oil & Gas Refining & Marketing",
+    companyType: "downstream_refiner"
+  }
 };
 
 export const STOCK_SYMBOLS = Object.keys(STOCKS_METADATA);
 
 // Simple helper to generate fallback historical data if Yahoo Finance fails
 function generateFallbackHistory(symbol: string, range: string): HistoricalDataPoint[] {
-  const basePrice = STOCKS_METADATA[symbol]?.fallbackPrice || 100;
+  const basePrice = STOCKS_METADATA[symbol]?.fallbackPrice;
+  if (typeof basePrice !== "number" || !Number.isFinite(basePrice)) {
+    throw new Error(`No verified fallback quote is configured for ${symbol}`);
+  }
   const history: HistoricalDataPoint[] = [];
   const now = new Date();
 
@@ -118,8 +142,12 @@ export async function fetchStockFromYahoo(symbol: string, range: string = "1mo")
     const lowPrices: (number | null)[] = quotes.low || [];
     const volumes: (number | null)[] = quotes.volume || [];
 
-    const price = meta.regularMarketPrice || closePrices[closePrices.length - 1] || STOCKS_METADATA[symbol].fallbackPrice;
-    const prevClose = meta.chartPreviousClose || meta.previousClose || price;
+    const quotePrice = meta.regularMarketPrice ?? closePrices[closePrices.length - 1] ?? STOCKS_METADATA[symbol]?.fallbackPrice;
+    if (typeof quotePrice !== "number" || !Number.isFinite(quotePrice)) {
+      throw new Error(`No usable Yahoo quote for ${symbol}`);
+    }
+    const price = quotePrice;
+    const prevClose = meta.chartPreviousClose ?? meta.previousClose ?? price;
     const change = price - prevClose;
     const changePercent = (change / prevClose) * 100;
 
@@ -189,5 +217,8 @@ export async function fetchStockFromYahoo(symbol: string, range: string = "1mo")
 }
 
 export async function fetchAllStocks(range: string): Promise<StockQuote[]> {
-  return Promise.all(STOCK_SYMBOLS.map(symbol => fetchStockFromYahoo(symbol, range)));
+  const settled = await Promise.allSettled(STOCK_SYMBOLS.map((symbol) => fetchStockFromYahoo(symbol, range)));
+  return settled
+    .filter((result): result is PromiseFulfilledResult<StockQuote> => result.status === "fulfilled")
+    .map((result) => result.value);
 }

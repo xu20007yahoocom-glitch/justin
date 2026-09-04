@@ -215,9 +215,14 @@ function buildSystemInstruction(language: string): string {
 8. 回應必須是單一 JSON 物件；絕不可輸出 JSON 程式碼區塊、Markdown 或任何 JSON 以外文字。`;
 }
 
+function issuerSpecificAnalysisGuardrail(symbol: string): string {
+  if (symbol !== "MPC") return "";
+  return "\n\nMPC 行业护栏：MPC（Marathon Petroleum Corporation）是下游炼油、成品油营销及中游业务公司，不是纯上游原油生产商。仅作定性观察时应聚焦炼油利润率、炼厂利用率、吞吐量、每桶经营成本、成品油需求、MPLX 中游业务贡献、资本回报、计划检修及意外停产。不得因 WTI 或 Brent 上涨就判断 MPC 盈利或股价一定上涨。payload 未提供可靠炼油价差资料时，必须在 competitiveAdvantage.limitations 写入：\"暂无可靠的炼油价差资料，当前原油价格不足以独立判断炼油利润趋势。\"；不得估算或编造 crack spread、季度数字、实时行情、目标价或新闻。";
+}
+
 function buildPrompt(context: AnalysisContext, dataLimitations: string[]): string {
   const payload = { symbol: context.quote.symbol, companyName: context.quote.companyName, marketScope: context.marketScope, finnhubSupported: context.finnhubSupported, quote: context.quote, technicals: context.technicals, companyBackground: context.companyBackgroundBase, financialMetrics: context.financialMetrics, topRevenueBusinesses: context.revenueBusinesses, unavailable: context.unavailable, dataLimitations };
-  return "你是股票研究的文字分析器。只使用 payload 中已有的精確數字；缺漏資料只能定性說明，不得捏造營收、淨利、市值、估值倍率、毛利率、52 週價格或業務佔比。只輸出單一合法 JSON 物件；不要輸出 ```json 程式碼區塊、Markdown 或任何額外文字。\n\nPAYLOAD:\n" + JSON.stringify(payload) + "\n\n嚴格輸出契約：必須使用下列 StockAnalysis 前端欄位名稱，不得使用 companyPositioning 等替代欄位。\n{\n  \"oneLineSummary\": \"string；一句投資觀點摘要\",\n  \"companyBackground\": \"string；公司定位與業務補述\",\n  \"catalysts\": [\"string；單一可能催化劑或風險趨勢\"],\n  \"topRevenueBusinesses\": [{ \"name\": \"string；業務名稱\", \"description\": \"string；定性業務說明，不得含未提供的數字或佔比\" }],\n  \"competitors\": [{ \"name\": \"string；同業名稱\", \"comparison\": \"string；定性比較\" }],\n  \"competitiveAdvantage\": { \"summary\": \"string；護城河或差異化\", \"limitations\": \"string；限制或需查證處\" }\n}\n上述六個欄位都必須存在；catalysts 必須是 0 至 5 個字串的陣列。";
+  return "你是股票研究的文字分析器。只使用 payload 中已有的精確數字；缺漏資料只能定性說明，不得捏造營收、淨利、市值、估值倍率、毛利率、52 週價格或業務佔比。只輸出單一合法 JSON 物件；不要輸出 ```json 程式碼區塊、Markdown 或任何額外文字。\n\nPAYLOAD:\n" + JSON.stringify(payload) + issuerSpecificAnalysisGuardrail(context.quote.symbol) + "\n\n嚴格輸出契約：必須使用下列 StockAnalysis 前端欄位名稱，不得使用 companyPositioning 等替代欄位。\n{\n  \"oneLineSummary\": \"string；一句投資觀點摘要\",\n  \"companyBackground\": \"string；公司定位與業務補述\",\n  \"catalysts\": [\"string；單一可能催化劑或風險趨勢\"],\n  \"topRevenueBusinesses\": [{ \"name\": \"string；業務名稱\", \"description\": \"string；定性業務說明，不得含未提供的數字或佔比\" }],\n  \"competitors\": [{ \"name\": \"string；同業名稱\", \"comparison\": \"string；定性比較\" }],\n  \"competitiveAdvantage\": { \"summary\": \"string；護城河或差異化\", \"limitations\": \"string；限制或需查證處\" }\n}\n上述六個欄位都必須存在；catalysts 必須是 0 至 5 個字串的陣列。";
 }
 
 class GeminiHttpError extends Error {
