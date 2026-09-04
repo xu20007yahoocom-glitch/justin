@@ -31,15 +31,19 @@ async function main() {
     assert.equal(url.hostname, "api.gdeltproject.org", "only the expected GDELT endpoint may be requested");
     gdeltFetches.push({ url, init });
     const query = url.searchParams.get("query");
+    await new Promise((resolve) => setTimeout(resolve, 700));
     return new Response(JSON.stringify({ articles: [{ title: `${query} verified article`, url: `https://example.test/${query}`, seendate: "20260904T010203Z" }] }), { status: 200, headers: { "content-type": "application/json" } });
   };
 
   try {
+    const elapsedStartedAt = Date.now();
     const res = responseRecorder();
-    await handler({ method: "GET", query: { refresh: "1" } }, res);
+    await handler({ method: "GET", headers: { "x-macro-request-id": "manual-parallel-001" }, query: { refresh: "1" } }, res);
+    const elapsedMs = Date.now() - elapsedStartedAt;
     const response = res.snapshot();
     assert.equal(response.statusCode, 200, "manual refresh must remain HTTP 200");
     assert.equal(response.headers.get("cache-control"), "private, no-store", "manual response must not be cached");
+    assert.ok(elapsedMs < 1_200, `two 700ms GDELT requests must remain parallel, actual ${elapsedMs}ms`);
     assert.equal(gdeltFetches.length, 2, "manual refresh must issue exactly two GDELT JSON requests");
     assert.deepEqual(gdeltFetches.map(({ url }) => url.searchParams.get("query")).sort(), ["economy", "geopolitics"]);
     for (const { url, init } of gdeltFetches) {
@@ -59,11 +63,13 @@ async function main() {
     assert.deepEqual(received.map((entry) => entry.category).sort(), ["economic", "geopolitical"]);
     assert.deepEqual(finished.map((entry) => entry.category).sort(), ["economic", "geopolitical"]);
     assert.ok(finished.every((entry) => entry.finalOutcome === "refresh_succeeded"));
+    assert.ok(finished.every((entry) => entry.requestId === "manual-parallel-001" && entry.refreshId && entry.invocationStartedAt && entry.providerStartedAt && entry.providerEndedAt));
+    assert.ok(finished.every((entry) => entry.httpStatus === 200 && entry.rawArticleCount === 1 && entry.filteredArticleCount === 1 && entry.cacheWriteSucceeded === true));
     assert.ok(!gdeltFetches.some(({ url }) => url.searchParams.get("format") === "rss"), "valid JSON must not trigger RSS fallback");
     assert.ok(response.payload.geopoliticalNews.items.some((item) => item.available), "manual result must include completed GDELT articles");
 
     console.info = originalInfo;
-    console.log(JSON.stringify({ passed: true, gdeltRequestCount: gdeltFetches.length, categories: finished.map((entry) => entry.category).sort(), finalOutcomes: finished.map((entry) => entry.finalOutcome) }, null, 2));
+    console.log(JSON.stringify({ passed: true, gdeltRequestCount: gdeltFetches.length, elapsedMs, categories: finished.map((entry) => entry.category).sort(), finalOutcomes: finished.map((entry) => entry.finalOutcome) }, null, 2));
   } finally {
     console.info = originalInfo;
   }

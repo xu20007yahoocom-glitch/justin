@@ -305,12 +305,12 @@ async function mapWithConcurrency<T, R>(values: readonly T[], limit: number, map
   return results;
 }
 
-async function generateMacro(forceRefresh = false, manualGdelt: { refreshId: string; deadlineAt: number } | null = null): Promise<GlobalMacroReference> {
+async function generateMacro(forceRefresh = false, manualGdelt: { requestId: string; refreshId: string; invocationStartedAt: string; deadlineAt: number } | null = null): Promise<GlobalMacroReference> {
   try {
     // For refresh=1, both categories await their real DOC API operation. Normal loads retain SWR.
     const gdeltPromise = Promise.allSettled([
-      getGdeltRecentArticles("geopolitical", { forceRefresh, awaitRefresh: Boolean(manualGdelt), refreshId: manualGdelt?.refreshId, deadlineAt: manualGdelt?.deadlineAt }),
-      getGdeltRecentArticles("economic", { forceRefresh, awaitRefresh: Boolean(manualGdelt), refreshId: manualGdelt?.refreshId, deadlineAt: manualGdelt?.deadlineAt })
+      getGdeltRecentArticles("geopolitical", { forceRefresh, awaitRefresh: Boolean(manualGdelt), requestId: manualGdelt?.requestId, refreshId: manualGdelt?.refreshId, invocationStartedAt: manualGdelt?.invocationStartedAt, deadlineAt: manualGdelt?.deadlineAt }),
+      getGdeltRecentArticles("economic", { forceRefresh, awaitRefresh: Boolean(manualGdelt), requestId: manualGdelt?.requestId, refreshId: manualGdelt?.refreshId, invocationStartedAt: manualGdelt?.invocationStartedAt, deadlineAt: manualGdelt?.deadlineAt })
     ]);
     const mineralPromise = getMiningComMineralNews({ forceRefresh });
     const [wti, brent, henryHub, rateResults, energyResults] = await Promise.all([
@@ -385,15 +385,15 @@ function createRefreshId(): string {
   return globalThis.crypto?.randomUUID?.() ?? `macro-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
-function startManualRefresh(): ManualRefreshFlight {
+function startManualRefresh(requestId: string, invocationStartedAt: string): ManualRefreshFlight {
   if (manualRefreshInFlight) {
-    console.info("MACRO_MANUAL_REFRESH", { refreshId: manualRefreshInFlight.refreshId, outcome: "joined_in_flight" });
+    console.info("MACRO_MANUAL_REFRESH", { requestId, refreshId: manualRefreshInFlight.refreshId, invocationStartedAt, outcome: "joined_in_flight" });
     return manualRefreshInFlight;
   }
   const refreshId = createRefreshId();
   const deadlineAt = Date.now() + MANUAL_GDELT_DEADLINE_MS;
-  console.info("MACRO_MANUAL_REFRESH", { refreshId, outcome: "started", gdeltDeadlineMs: MANUAL_GDELT_DEADLINE_MS });
-  const promise = generateMacro(true, { refreshId, deadlineAt }).finally(() => { manualRefreshInFlight = null; });
+  console.info("MACRO_MANUAL_REFRESH", { requestId, refreshId, invocationStartedAt, outcome: "started", gdeltDeadlineMs: MANUAL_GDELT_DEADLINE_MS });
+  const promise = generateMacro(true, { requestId, refreshId, invocationStartedAt, deadlineAt }).finally(() => { manualRefreshInFlight = null; });
   manualRefreshInFlight = { refreshId, promise };
   return manualRefreshInFlight;
 }
@@ -411,6 +411,12 @@ function waitForManualRefresh(operation: Promise<GlobalMacroReference>): Promise
   });
 }
 
+function requestIdFor(req: VercelRequest): string {
+  const raw = req.headers?.["x-macro-request-id"];
+  const requested = Array.isArray(raw) ? raw[0] : raw;
+  return typeof requested === "string" && /^[a-zA-Z0-9_-]{1,80}$/.test(requested) ? requested : createRefreshId();
+}
+
 function isRefreshRequest(req: VercelRequest): boolean {
   const value = req.query?.refresh;
   return value === "1" || (Array.isArray(value) && value.includes("1"));
@@ -419,13 +425,17 @@ function isRefreshRequest(req: VercelRequest): boolean {
 export default async function handler(req: VercelRequest, res: VercelResponse): Promise<void> {
   if (req.method !== "GET") { res.status(405).json({ error: "Method not allowed" }); return; }
   try {
-    if (isRefreshRequest(req)) {
+    const requestId = requestIdFor(req);
+    const invocationStartedAt = new Date().toISOString();
+    const manualRefresh = isRefreshRequest(req);
+    console.info("MACRO_REQUEST", { requestId, manualRefresh, invocationStartedAt, method: req.method });
+    if (manualRefresh) {
       const previous = macroCache?.value ?? null;
-      const flight = startManualRefresh();
+      const flight = startManualRefresh(requestId, invocationStartedAt);
       const refreshed = await waitForManualRefresh(flight.promise);
       const value = refreshed ?? previous ?? unavailable("正在刷新宏观数据；当前没有可用的历史缓存");
       const status = refreshed ? refreshStatus(refreshed) : previous ? "partial" : "unavailable";
-      console.info("MACRO_MANUAL_REFRESH", { refreshId: flight.refreshId, outcome: refreshed ? "completed" : "timeout_fallback", status, timeoutMs: MANUAL_REFRESH_TIMEOUT_MS, usedPreviousCache: !refreshed && Boolean(previous) });
+      console.info("MACRO_MANUAL_REFRESH", { requestId, refreshId: flight.refreshId, invocationStartedAt, outcome: refreshed ? "completed" : "timeout_fallback", status, timeoutMs: MANUAL_REFRESH_TIMEOUT_MS, usedPreviousCache: !refreshed && Boolean(previous) });
       res.setHeader("X-Macro-Refresh-Status", status);
       // Each manual request carries a nonce; no-store prevents a CDN/browser from preserving it.
       res.setHeader("Cache-Control", "private, no-store");
@@ -433,6 +443,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse): 
       return;
     }
     if (macroCache && macroCache.expiresAt > Date.now()) {
+      console.info("MACRO_REQUEST", { requestId, manualRefresh: false, invocationStartedAt, outcome: "macro_cache_hit" });
       res.setHeader("Cache-Control", macroResponseCacheControl(macroCache.value));
       res.status(200).json({ ...macroCache.value, cachedAt: macroCache.value.generatedAt });
       return;

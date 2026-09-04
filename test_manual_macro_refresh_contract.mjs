@@ -7,17 +7,21 @@ const fred = readFileSync(new URL("./lib/providers/fred.ts", import.meta.url), "
 const eia = readFileSync(new URL("./lib/providers/eia.ts", import.meta.url), "utf8");
 const gdelt = readFileSync(new URL("./lib/providers/gdelt.ts", import.meta.url), "utf8");
 const mining = readFileSync(new URL("./lib/providers/mineral-rss.ts", import.meta.url), "utf8");
+const requestClient = readFileSync(new URL("./src/lib/globalMacroRequest.ts", import.meta.url), "utf8");
 
 const assertions = {
-  frontend_refresh_url_has_nonce: component.includes('`/api/global/macro?refresh=1&_=${Date.now()}`'),
-  frontend_bypasses_browser_cache: component.includes('cache: "no-store"') && component.includes('"Cache-Control": "no-cache"'),
+  frontend_refresh_url_has_nonce: requestClient.includes('`/api/global/macro?refresh=1&t=${Date.now()}`'),
+  frontend_bypasses_browser_cache: requestClient.includes('cache: manual ? "no-store" : "default"') && requestClient.includes('"Cache-Control": "no-cache"'),
+  frontend_shares_normal_and_manual_inflight_requests: requestClient.includes("let normalInFlight") && requestClient.includes("let manualInFlight") && requestClient.includes("if (existing) return existing"),
+  frontend_sends_request_id: requestClient.includes('"X-Macro-Request-Id": requestId'),
   frontend_does_not_reload_document: !component.includes("location.reload"),
-  frontend_prevents_double_click: component.includes("disabled={loading || refreshing}") && component.includes("if (refreshing || loading) return"),
+  frontend_prevents_double_click: component.includes('type="button"') && component.includes("disabled={loading || refreshing}") && component.includes("if (refreshing || loading) return"),
   frontend_keeps_existing_data_after_manual_error: component.includes("if (!manual) setData(emptyMacro"),
   frontend_displays_refresh_progress: component.includes('refreshing ? "正在刷新…"') && component.includes("animate-spin"),
   frontend_feedback_auto_hides: component.includes("window.setTimeout(() => setRefreshFeedback(null), 4_000)"),
   frontend_exposes_news_cache_metadata: component.includes("缓存更新时间：{formatTime(item.cacheUpdatedAt)}") && component.includes("缓存状态：{cacheStatusLabel[item.cacheStatus]}"),
   backend_recognizes_refresh_parameter: macro.includes("function isRefreshRequest") && macro.includes('value === "1"'),
+  backend_records_request_and_invocation_ids: macro.includes("function requestIdFor") && macro.includes('console.info("MACRO_REQUEST"') && macro.includes("invocationStartedAt"),
   backend_has_nine_second_limit: macro.includes("MANUAL_REFRESH_TIMEOUT_MS = 9_000"),
   backend_clears_wait_timer: macro.includes("clearTimeout(timer)"),
   backend_single_flight: macro.includes("let manualRefreshInFlight") && macro.includes("if (manualRefreshInFlight) {") && macro.includes("return manualRefreshInFlight;"),
@@ -29,6 +33,8 @@ const assertions = {
   gdelt_force_refresh_respects_cooldown: gdelt.includes("export interface GdeltRefreshOptions") && gdelt.includes("awaitRefresh?: boolean") && gdelt.includes("await getOrStartRefresh(key, category, options)") && gdelt.includes("waitUntil(operation)") && gdelt.includes("const reusableEntry = stale ?? (options.forceRefresh ? cache.get(key) ?? null : null)"),
   mining_force_refresh_preserves_lkg: mining.includes("export interface MineralRssRefreshOptions") && mining.includes("const fallback = stale ?? (fresh && options.forceRefresh ? { ...fresh, isStale: true } : null)"),
   gdelt_manual_fetch_is_not_fire_and_forget: gdelt.includes('cache: "no-store"') && gdelt.includes('event: "provider_request_started"') && gdelt.includes('event: "provider_response_received"') && gdelt.includes('event: "provider_request_failed"') && !gdelt.includes('"refresh_started"'),
+  gdelt_manual_categories_bypass_serial_queue: gdelt.includes("reserveRequestSlot(Boolean(options.awaitRefresh))") && gdelt.includes("if (parallelManualRefresh) return 0"),
+  gdelt_final_diagnostic_has_counts_and_cache_write: gdelt.includes('event: "manual_refresh_category_finished"') && gdelt.includes("cacheWriteSucceeded") && gdelt.includes("rawArticleCount") && gdelt.includes("filteredArticleCount") && gdelt.includes("providerStartedAt") && gdelt.includes("providerEndedAt"),
 };
 
 for (const [name, passed] of Object.entries(assertions)) assert.equal(passed, true, name);

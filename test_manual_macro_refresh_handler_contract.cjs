@@ -37,12 +37,12 @@ async function main() {
       // Leave the second refresh pending: handler timeout must return the saved macro cache.
       return new Promise(() => {});
     }
-    // GDELT background jobs receive a controlled rate-limit response only.
+    // Each directly awaited GDELT category receives a controlled rate-limit response.
     gdeltCalls += 1;
     return new Response("rate limited", { status: 429, headers: { "retry-after": "60", "content-type": "text/plain" } });
   };
 
-  const req = { method: "GET", query: { refresh: "1" } };
+  const req = { method: "GET", headers: { "x-macro-request-id": "manual-timeout-001" }, query: { refresh: "1" } };
   const primed = await call(req);
   assert.equal(primed.statusCode, 200, "initial manual refresh must stay HTTP 200");
   assert.equal(miningCalls, 1, "initial refresh must call the RSS provider once");
@@ -59,7 +59,7 @@ async function main() {
     assert.ok(result.payload.criticalMinerals.news.some((item) => item.available), "timeout fallback must retain previous successful news");
   }
   assert.equal(miningCalls, 2, "two concurrent requests must share one second-round macro refresh");
-  assert.equal(gdeltCalls, 1, "a queued GDELT category must not bypass Retry-After from the first 429");
+  assert.equal(gdeltCalls, 2, "the two independent categories must each issue one JSON request without retries");
   assert.ok(elapsedMs >= 8_500 && elapsedMs < 11_500, `manual wait should be about nine seconds, got ${elapsedMs}ms`);
   console.log(JSON.stringify({ passed: true, miningCalls, gdeltCalls, elapsedMs, statuses: [first.headers.get("x-macro-refresh-status"), second.headers.get("x-macro-refresh-status")] }, null, 2));
 }
