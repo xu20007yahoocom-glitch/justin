@@ -135,14 +135,21 @@ function eiaCountryGroup(country: string, result: EiaResult<EiaCountryEnergy> | 
 
 function gdeltItems(label: string, result: GdeltResult<GdeltArticle[]> | null): GlobalMacroItem[] {
   const errorCategory = result?.errorCategory ? `错误类别：${result.errorCategory}；` : "";
+  const cacheNotice = result?.cacheStatus === "fresh"
+    ? "缓存状态：新鲜资料；"
+    : result?.cacheStatus === "stale_cooldown"
+      ? "正在使用缓存资料，来源暂时受限；"
+      : result?.cacheStatus === "stale_refreshing"
+        ? "正在使用缓存资料，后台刷新中；"
+        : "";
   if (!result || result.data.length === 0) {
-    return [unavailableItem(label, "GDELT", "GDELT DOC 2.0", "https://api.gdeltproject.org/api/v2/doc/doc", `${errorCategory}GDELT 未返回可验证新闻；非实时，定期更新`)];
+    return [unavailableItem(label, "GDELT", "GDELT DOC 2.0", "https://api.gdeltproject.org/api/v2/doc/doc", `${errorCategory}${result?.cacheStatus === "unavailable_cooldown" ? "来源暂时受限；" : ""}GDELT 未返回可验证新闻；非实时，定期更新`)];
   }
   const transport = result.sourceFormat === "rss" ? "GDELT RSS fallback" : "GDELT JSON";
   return result.data.map((article) => ({
     label: article.title, value: article.domain ? `新闻来源：${article.domain}` : "新闻来源链接可用", unit: null, dataTime: article.seenAt,
     source: { provider: "GDELT", title: article.title, url: article.url, dataTime: article.seenAt },
-    note: `类别：${label}；${result.isStale ? "服务端缓存可能过期；" : ""}${transport} 新闻索引，非实时，定期更新`, available: true
+    note: `类别：${label}；${cacheNotice}${result.isStale ? "服务端旧缓存；" : ""}${transport} 新闻索引，非实时，定期更新`, available: true
   }));
 }
 
@@ -176,9 +183,10 @@ function unavailableEnergyGroups(): GlobalMacroCountryGroup[] {
 function macroResponseCacheControl(value: GlobalMacroReference): string {
   const hasUnavailableGdelt = value.geopoliticalNews.items.some((item) => !item.available);
   const hasUnavailableMiningNews = value.criticalMinerals.news.some((item) => !item.available);
-  // Keep CDN and in-process behavior aligned: unavailable news must not be held for 30 minutes.
-  return hasUnavailableGdelt || hasUnavailableMiningNews
-    ? "s-maxage=60, stale-while-revalidate=0"
+  // A stale or unavailable news category must revalidate quickly. CDN SWR serves the current
+  // response immediately while coalescing revalidation, so a visitor never waits for GDELT.
+  return hasUnavailableGdelt || hasUnavailableMiningNews || value.isStale
+    ? "s-maxage=60, stale-while-revalidate=300"
     : "s-maxage=1800, stale-while-revalidate=3600";
 }
 
@@ -263,7 +271,9 @@ async function generateMacro(): Promise<GlobalMacroReference> {
     };
     // A missing news category gets a short macro cache so it can recover without holding empty cards for 30 minutes.
     const hasNews = (result: GdeltResult<GdeltArticle[]> | MineralRssResult<MineralRssArticle[]> | null): boolean => Boolean(result?.data.length);
-    const cacheTtl = hasNews(geopolitical) && hasNews(economicNews) && hasNews(mineralNews) ? MACRO_CACHE_TTL_MS : MACRO_NEWS_RETRY_TTL_MS;
+    const cacheTtl = hasNews(geopolitical) && hasNews(economicNews) && hasNews(mineralNews) && !value.isStale
+      ? MACRO_CACHE_TTL_MS
+      : MACRO_NEWS_RETRY_TTL_MS;
     macroCache = { value, expiresAt: Date.now() + cacheTtl };
     return value;
   } catch (error) {

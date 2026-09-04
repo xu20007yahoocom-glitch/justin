@@ -1,14 +1,15 @@
 const GDELT_DOC_URL = "https://api.gdeltproject.org/api/v2/doc/doc";
 const REQUEST_TIMEOUT_MS = 12_000;
-// GDELT's public DOC endpoint asks clients to limit requests to one every five seconds.
 const MIN_REQUEST_INTERVAL_MS = 5_200;
 const SUCCESS_TTL_MS = 30 * 60 * 1_000;
+const STALE_TTL_MS = 24 * 60 * 60 * 1_000;
 const EMPTY_OR_FAILURE_TTL_MS = 60_000;
-const STALE_TTL_MS = 2 * 60 * 60 * 1_000;
+const DEFAULT_RETRY_AFTER_MS = 60_000;
 const MAX_ARTICLES = 5;
 
 export type GdeltNewsCategory = "geopolitical" | "economic";
 export type GdeltSourceFormat = "json" | "rss";
+export type GdeltCacheStatus = "fresh" | "stale_refreshing" | "stale_cooldown" | "unavailable_refreshing" | "unavailable_cooldown";
 
 const CATEGORY_QUERY: Readonly<Record<GdeltNewsCategory, string>> = {
   geopolitical: "geopolitics",
@@ -37,6 +38,11 @@ interface CacheEntry<T> {
   sourceFormat: GdeltSourceFormat;
 }
 
+interface FailureCacheEntry {
+  until: number;
+  outcome: GdeltOutcome;
+}
+
 export type GdeltOutcome =
   | "success"
   | "rss_fallback_success"
@@ -50,14 +56,16 @@ export type GdeltOutcome =
   | "http_200_non_json"
   | "articles_empty"
   | "articles_filtered_empty"
-  | "failure_short_cache";
+  | "failure_short_cache"
+  | "refresh_started";
 
 export interface GdeltResult<T> {
   data: T;
   fetchedAt: string;
   isStale: boolean;
   sourceFormat: GdeltSourceFormat;
-  /** Null for a verified article payload; otherwise a safe, non-body diagnostic category. */
+  cacheStatus: GdeltCacheStatus;
+  /** Null for a verified fresh article payload; otherwise a safe, non-body diagnostic category. */
   errorCategory: GdeltOutcome | null;
 }
 
@@ -76,13 +84,15 @@ interface RequestResult {
   allowRssFallback: boolean;
   sourceFormat: GdeltSourceFormat;
   outcome: GdeltOutcome;
+  cooldownMs: number | null;
 }
 
 const cache = new Map<string, CacheEntry<GdeltArticle[]>>();
-const failureCacheUntil = new Map<string, number>();
-const inFlight = new Map<string, Promise<GdeltResult<GdeltArticle[]> | null>>();
+const failureCache = new Map<string, FailureCacheEntry>();
+const inFlight = new Map<string, Promise<void>>();
 let requestQueue: Promise<void> = Promise.resolve();
 let nextRequestAt = 0;
+let providerCooldownUntil = 0;
 
 function text(value: unknown, limit = 500): string | null {
   return typeof value === "string" && value.trim() ? value.trim().slice(0, limit) : null;
@@ -119,7 +129,7 @@ function xmlText(block: string, tag: string): string | null {
 }
 
 function diagnostic(payload: Record<string, unknown>): void {
-  // Does not include response bodies, article descriptions, credentials or user data.
+  // Deliberately excludes response bodies, article descriptions, credentials and user data.
   console.info("GDELT_DIAGNOSTIC", payload);
 }
 
@@ -157,6 +167,15 @@ function outcomeForHttpStatus(status: number): GdeltOutcome {
   return "http_error";
 }
 
+function parseRetryAfter(value: string | null): number {
+  if (!value) return DEFAULT_RETRY_AFTER_MS;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds >= 0) return Math.max(DEFAULT_RETRY_AFTER_MS, Math.round(seconds * 1_000));
+  const dateMs = Date.parse(value);
+  if (Number.isFinite(dateMs)) return Math.max(DEFAULT_RETRY_AFTER_MS, dateMs - Date.now());
+  return DEFAULT_RETRY_AFTER_MS;
+}
+
 function errorCategory(error: unknown): "timeout" | "network_error" {
   return error instanceof Error && error.name === "AbortError" ? "timeout" : "network_error";
 }
@@ -169,7 +188,7 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** Serializes outbound DOC API starts without requiring an API key. */
+/** Serializes DOC API starts in the current serverless instance. CDN SWR prevents most cross-instance refreshes. */
 async function reserveRequestSlot(): Promise<number> {
   let release!: () => void;
   const previous = requestQueue;
@@ -185,22 +204,29 @@ async function reserveRequestSlot(): Promise<number> {
   }
 }
 
-function cacheSuccess(key: string, data: GdeltArticle[], sourceFormat: GdeltSourceFormat): GdeltResult<GdeltArticle[]> {
-  const fetchedAt = new Date().toISOString();
-  const now = Date.now();
-  cache.set(key, { value: data, fetchedAt, sourceFormat, expiresAt: now + SUCCESS_TTL_MS, staleUntil: now + SUCCESS_TTL_MS + STALE_TTL_MS });
-  failureCacheUntil.delete(key);
-  return { data, fetchedAt, sourceFormat, isStale: false, errorCategory: null };
+function cachedResult(entry: CacheEntry<GdeltArticle[]>, cacheStatus: GdeltCacheStatus, errorCategory: GdeltOutcome | null): GdeltResult<GdeltArticle[]> {
+  return { data: entry.value, fetchedAt: entry.fetchedAt, sourceFormat: entry.sourceFormat, isStale: cacheStatus !== "fresh", cacheStatus, errorCategory };
 }
 
-function getCache(key: string): { fresh: GdeltResult<GdeltArticle[]> | null; stale: GdeltResult<GdeltArticle[]> | null } {
+function readCache(key: string): { fresh: GdeltResult<GdeltArticle[]> | null; stale: CacheEntry<GdeltArticle[]> | null } {
   const entry = cache.get(key);
   if (!entry) return { fresh: null, stale: null };
   const now = Date.now();
-  if (now <= entry.expiresAt) return { fresh: { data: entry.value, fetchedAt: entry.fetchedAt, sourceFormat: entry.sourceFormat, isStale: false, errorCategory: null }, stale: null };
-  if (now <= entry.staleUntil) return { fresh: null, stale: { data: entry.value, fetchedAt: entry.fetchedAt, sourceFormat: entry.sourceFormat, isStale: true, errorCategory: null } };
+  if (now <= entry.expiresAt) return { fresh: cachedResult(entry, "fresh", null), stale: null };
+  if (now <= entry.staleUntil) return { fresh: null, stale: entry };
   cache.delete(key);
   return { fresh: null, stale: null };
+}
+
+function cacheSuccess(key: string, data: GdeltArticle[], sourceFormat: GdeltSourceFormat): void {
+  const fetchedAt = new Date().toISOString();
+  const now = Date.now();
+  cache.set(key, { value: data, fetchedAt, sourceFormat, expiresAt: now + SUCCESS_TTL_MS, staleUntil: now + STALE_TTL_MS });
+  failureCache.delete(key);
+}
+
+function unavailableResult(sourceFormat: GdeltSourceFormat, cacheStatus: GdeltCacheStatus, errorCategory: GdeltOutcome): GdeltResult<GdeltArticle[]> {
+  return { data: [], fetchedAt: new Date().toISOString(), isStale: false, sourceFormat, cacheStatus, errorCategory };
 }
 
 function parseRssArticles(xml: string): { rawCount: number; articles: GdeltArticle[] } {
@@ -234,22 +260,25 @@ async function requestAttempt(category: GdeltNewsCategory, sourceFormat: GdeltSo
 
     if (!response.ok) {
       const outcome = outcomeForHttpStatus(response.status);
-      diagnostic({ ...base, outcome, httpStatus: response.status, contentType, responseTextLength: raw.length, topLevelFields: [], articlesIsArray: false, rawArticleCount: 0, filteredArticleCount: 0, errorCategory: outcome });
-      return { articles: null, retryOnTimeout: false, allowRssFallback: sourceFormat === "json" && outcome !== "http_429", sourceFormat, outcome };
+      const cooldownMs = outcome === "http_429" ? parseRetryAfter(response.headers.get("retry-after")) : null;
+      if (cooldownMs !== null) providerCooldownUntil = Math.max(providerCooldownUntil, Date.now() + cooldownMs);
+      diagnostic({ ...base, outcome, httpStatus: response.status, contentType, responseTextLength: raw.length, topLevelFields: [], articlesIsArray: false, rawArticleCount: 0, filteredArticleCount: 0, retryAfterMs: cooldownMs, errorCategory: outcome });
+      // 429 is a hard cooldown: never immediately retry JSON or fall through to RSS.
+      return { articles: null, retryOnTimeout: false, allowRssFallback: sourceFormat === "json" && outcome !== "http_429", sourceFormat, outcome, cooldownMs };
     }
 
-    // GDELT can return a plaintext public-rate-limit notice with HTTP 200.
     if (looksLikeGdeltRateLimit(raw)) {
       const outcome: GdeltOutcome = "rate_limited_content";
-      diagnostic({ ...base, outcome, httpStatus: response.status, contentType, responseTextLength: raw.length, topLevelFields: [], articlesIsArray: false, rawArticleCount: 0, filteredArticleCount: 0, errorCategory: outcome });
-      return { articles: null, retryOnTimeout: false, allowRssFallback: false, sourceFormat, outcome };
+      providerCooldownUntil = Math.max(providerCooldownUntil, Date.now() + DEFAULT_RETRY_AFTER_MS);
+      diagnostic({ ...base, outcome, httpStatus: response.status, contentType, responseTextLength: raw.length, topLevelFields: [], articlesIsArray: false, rawArticleCount: 0, filteredArticleCount: 0, retryAfterMs: DEFAULT_RETRY_AFTER_MS, errorCategory: outcome });
+      return { articles: null, retryOnTimeout: false, allowRssFallback: false, sourceFormat, outcome, cooldownMs: DEFAULT_RETRY_AFTER_MS };
     }
 
     if (sourceFormat === "rss") {
       const parsed = parseRssArticles(raw);
       const outcome: GdeltOutcome = parsed.rawCount === 0 ? "articles_empty" : parsed.articles.length === 0 ? "articles_filtered_empty" : "rss_fallback_success";
       diagnostic({ ...base, outcome, httpStatus: response.status, contentType, responseTextLength: raw.length, topLevelFields: [], articlesIsArray: false, rawArticleCount: parsed.rawCount, filteredArticleCount: parsed.articles.length, errorCategory: outcome === "rss_fallback_success" ? null : outcome });
-      return { articles: parsed.articles.length ? parsed.articles : null, retryOnTimeout: false, allowRssFallback: false, sourceFormat, outcome };
+      return { articles: parsed.articles.length ? parsed.articles : null, retryOnTimeout: false, allowRssFallback: false, sourceFormat, outcome, cooldownMs: null };
     }
 
     let body: GdeltResponse;
@@ -258,7 +287,7 @@ async function requestAttempt(category: GdeltNewsCategory, sourceFormat: GdeltSo
     } catch {
       const outcome: GdeltOutcome = "http_200_non_json";
       diagnostic({ ...base, outcome, httpStatus: response.status, contentType, responseTextLength: raw.length, topLevelFields: [], articlesIsArray: false, rawArticleCount: 0, filteredArticleCount: 0, errorCategory: outcome });
-      return { articles: null, retryOnTimeout: false, allowRssFallback: true, sourceFormat, outcome };
+      return { articles: null, retryOnTimeout: false, allowRssFallback: true, sourceFormat, outcome, cooldownMs: null };
     }
 
     const topLevelFields = Object.keys(body).slice(0, 30);
@@ -267,11 +296,11 @@ async function requestAttempt(category: GdeltNewsCategory, sourceFormat: GdeltSo
     const articles = rows.map(mapArticle).filter((article): article is GdeltArticle => article !== null).slice(0, MAX_ARTICLES);
     const outcome: GdeltOutcome = rows.length === 0 ? "articles_empty" : articles.length === 0 ? "articles_filtered_empty" : "success";
     diagnostic({ ...base, outcome, httpStatus: response.status, contentType, responseTextLength: raw.length, topLevelFields, articlesIsArray, rawArticleCount: rows.length, filteredArticleCount: articles.length, errorCategory: outcome === "success" ? null : outcome });
-    return { articles: articles.length ? articles : null, retryOnTimeout: false, allowRssFallback: outcome !== "success", sourceFormat, outcome };
+    return { articles: articles.length ? articles : null, retryOnTimeout: false, allowRssFallback: outcome !== "success", sourceFormat, outcome, cooldownMs: null };
   } catch (error) {
     const outcome = errorCategory(error);
     diagnostic({ ...base, outcome, httpStatus: null, contentType: null, responseTextLength: 0, topLevelFields: [], articlesIsArray: false, rawArticleCount: 0, filteredArticleCount: 0, errorCategory: outcome });
-    return { articles: null, retryOnTimeout: outcome === "timeout" && sourceFormat === "json", allowRssFallback: sourceFormat === "json", sourceFormat, outcome };
+    return { articles: null, retryOnTimeout: outcome === "timeout" && sourceFormat === "json", allowRssFallback: sourceFormat === "json", sourceFormat, outcome, cooldownMs: null };
   } finally {
     clearTimeout(timeout);
   }
@@ -280,52 +309,63 @@ async function requestAttempt(category: GdeltNewsCategory, sourceFormat: GdeltSo
 async function requestArticles(category: GdeltNewsCategory): Promise<RequestResult> {
   let json = await requestAttempt(category, "json", 1);
   if (!json.articles && json.retryOnTimeout) json = await requestAttempt(category, "json", 2);
-  // Invalid/empty JSON may use same-endpoint RSS fallback; explicit public rate limiting does not send another immediate request.
+  // Invalid/empty JSON may use same-endpoint RSS fallback. 429 and public rate-limit notices never do.
   return json.articles || !json.allowRssFallback ? json : requestAttempt(category, "rss", 1);
 }
 
-function failureResult(sourceFormat: GdeltSourceFormat, outcome: GdeltOutcome): GdeltResult<GdeltArticle[]> {
-  return { data: [], fetchedAt: new Date().toISOString(), isStale: false, sourceFormat, errorCategory: outcome };
-}
-
-/**
- * Fetches only article metadata from fixed, public GDELT probes. It never synthesizes news.
- * JSON is preferred; GDELT RSS is a same-endpoint fallback when JSON is unusable.
- */
-export async function getGdeltRecentArticles(category: GdeltNewsCategory): Promise<GdeltResult<GdeltArticle[]> | null> {
-  const key = `gdelt:doc:${category}:${CATEGORY_QUERY[category]}`;
-  const { fresh, stale } = getCache(key);
-  if (fresh) {
-    diagnostic({ category, query: CATEGORY_QUERY[category], sourceFormat: fresh.sourceFormat, requestUrl: buildUrl(category, fresh.sourceFormat).toString(), attempt: 0, outcome: "success", cache: "fresh", timeoutMs: REQUEST_TIMEOUT_MS, rateLimitWaitMs: 0, httpStatus: null, contentType: null, responseTextLength: 0, topLevelFields: [], articlesIsArray: fresh.sourceFormat === "json", rawArticleCount: fresh.data.length, filteredArticleCount: fresh.data.length, errorCategory: null });
-    return fresh;
-  }
-  const failureUntil = failureCacheUntil.get(key) ?? 0;
-  if (failureUntil > Date.now()) {
-    diagnostic({ category, query: CATEGORY_QUERY[category], sourceFormat: "json", requestUrl: buildUrl(category, "json").toString(), attempt: 0, outcome: "failure_short_cache", cache: "failure_short", timeoutMs: REQUEST_TIMEOUT_MS, rateLimitWaitMs: 0, httpStatus: null, contentType: null, responseTextLength: 0, topLevelFields: [], articlesIsArray: false, rawArticleCount: 0, filteredArticleCount: 0, errorCategory: "failure_short_cache" });
-    return stale ?? failureResult("json", "failure_short_cache");
-  }
-  const running = inFlight.get(key);
-  if (running) return running;
-
-  const operation = (async (): Promise<GdeltResult<GdeltArticle[]> | null> => {
+function startRefresh(key: string, category: GdeltNewsCategory): void {
+  if (inFlight.has(key) || Date.now() < providerCooldownUntil) return;
+  const operation = (async (): Promise<void> => {
     try {
       const result = await requestArticles(category);
-      if (!result.articles) {
-        failureCacheUntil.set(key, Date.now() + EMPTY_OR_FAILURE_TTL_MS);
-        // Retain the last successful payload as stale; a failed refresh never overwrites it.
-        return stale ?? failureResult(result.sourceFormat, result.outcome);
+      if (result.articles) {
+        cacheSuccess(key, result.articles, result.sourceFormat);
+        diagnostic({ category, query: CATEGORY_QUERY[category], sourceFormat: result.sourceFormat, requestUrl: buildUrl(category, result.sourceFormat).toString(), attempt: 0, outcome: result.outcome, cache: "refresh_success", timeoutMs: REQUEST_TIMEOUT_MS, errorCategory: null });
+        return;
       }
-      return cacheSuccess(key, result.articles, result.sourceFormat);
+      const cooldownUntil = result.cooldownMs ? Date.now() + result.cooldownMs : Date.now() + EMPTY_OR_FAILURE_TTL_MS;
+      failureCache.set(key, { until: Math.max(cooldownUntil, providerCooldownUntil), outcome: result.outcome });
+      diagnostic({ category, query: CATEGORY_QUERY[category], sourceFormat: result.sourceFormat, requestUrl: buildUrl(category, result.sourceFormat).toString(), attempt: 0, outcome: result.outcome, cache: "refresh_failed_kept_last_known_good", timeoutMs: REQUEST_TIMEOUT_MS, cooldownUntil: Math.max(cooldownUntil, providerCooldownUntil), errorCategory: result.outcome });
     } catch (error) {
       const outcome: GdeltOutcome = "network_error";
-      diagnostic({ category, query: CATEGORY_QUERY[category], sourceFormat: "json", requestUrl: buildUrl(category, "json").toString(), attempt: 0, outcome, timeoutMs: REQUEST_TIMEOUT_MS, rateLimitWaitMs: 0, httpStatus: null, contentType: null, responseTextLength: 0, topLevelFields: [], articlesIsArray: false, rawArticleCount: 0, filteredArticleCount: 0, errorCategory: error instanceof Error ? error.name : outcome });
-      failureCacheUntil.set(key, Date.now() + EMPTY_OR_FAILURE_TTL_MS);
-      return stale ?? failureResult("json", outcome);
+      failureCache.set(key, { until: Date.now() + EMPTY_OR_FAILURE_TTL_MS, outcome });
+      diagnostic({ category, query: CATEGORY_QUERY[category], sourceFormat: "json", requestUrl: buildUrl(category, "json").toString(), attempt: 0, outcome, cache: "refresh_exception_kept_last_known_good", timeoutMs: REQUEST_TIMEOUT_MS, errorCategory: error instanceof Error ? error.name : outcome });
     } finally {
       inFlight.delete(key);
     }
   })();
-
   inFlight.set(key, operation);
-  return operation;
+  // This is intentionally detached: a page receives cached data immediately.
+  void operation;
+}
+
+/**
+ * Returns fresh or last-known-good article metadata immediately.  A stale cache triggers a
+ * best-effort background refresh.  With no historical success, it returns a structured empty
+ * result immediately and starts one background request; it never synthesizes news.
+ */
+export async function getGdeltRecentArticles(category: GdeltNewsCategory): Promise<GdeltResult<GdeltArticle[]> | null> {
+  const key = `gdelt:doc:${category}:${CATEGORY_QUERY[category]}`;
+  const { fresh, stale } = readCache(key);
+  if (fresh) {
+    diagnostic({ category, query: CATEGORY_QUERY[category], sourceFormat: fresh.sourceFormat, requestUrl: buildUrl(category, fresh.sourceFormat).toString(), attempt: 0, outcome: "success", cache: "fresh", timeoutMs: REQUEST_TIMEOUT_MS, httpStatus: null, contentType: null, responseTextLength: 0, topLevelFields: [], articlesIsArray: fresh.sourceFormat === "json", rawArticleCount: fresh.data.length, filteredArticleCount: fresh.data.length, errorCategory: null });
+    return fresh;
+  }
+
+  const failure = failureCache.get(key);
+  const now = Date.now();
+  const inCooldown = now < providerCooldownUntil || (failure?.until ?? 0) > now;
+  if (stale) {
+    const error = failure?.outcome ?? null;
+    const status: GdeltCacheStatus = inCooldown ? "stale_cooldown" : "stale_refreshing";
+    if (!inCooldown) startRefresh(key, category);
+    diagnostic({ category, query: CATEGORY_QUERY[category], sourceFormat: stale.sourceFormat, requestUrl: buildUrl(category, stale.sourceFormat).toString(), attempt: 0, outcome: error ?? "success", cache: status, timeoutMs: REQUEST_TIMEOUT_MS, staleUntil: stale.staleUntil, cooldownUntil: providerCooldownUntil || null, httpStatus: null, contentType: null, responseTextLength: 0, topLevelFields: [], articlesIsArray: stale.sourceFormat === "json", rawArticleCount: stale.value.length, filteredArticleCount: stale.value.length, errorCategory: error });
+    return cachedResult(stale, status, error);
+  }
+
+  const outcome = failure?.outcome ?? (inCooldown ? "rate_limited_content" : "refresh_started");
+  const status: GdeltCacheStatus = inCooldown ? "unavailable_cooldown" : "unavailable_refreshing";
+  if (!inCooldown) startRefresh(key, category);
+  diagnostic({ category, query: CATEGORY_QUERY[category], sourceFormat: "json", requestUrl: buildUrl(category, "json").toString(), attempt: 0, outcome, cache: status, timeoutMs: REQUEST_TIMEOUT_MS, cooldownUntil: providerCooldownUntil || null, httpStatus: null, contentType: null, responseTextLength: 0, topLevelFields: [], articlesIsArray: false, rawArticleCount: 0, filteredArticleCount: 0, errorCategory: outcome });
+  return unavailableResult("json", status, outcome);
 }
