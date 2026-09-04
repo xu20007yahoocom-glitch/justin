@@ -28,7 +28,7 @@ async function main() {
   delete process.env.FRED_API_KEY;
   delete process.env.EIA_API_KEY;
   let miningCalls = 0;
-  let gdeltCalls = 0;
+  let macroRssCalls = 0;
   global.fetch = async (input) => {
     const url = String(input);
     if (url.includes("mining.com/feed/")) {
@@ -37,9 +37,9 @@ async function main() {
       // Leave the second refresh pending: handler timeout must return the saved macro cache.
       return new Promise(() => {});
     }
-    // Each directly awaited GDELT category receives a controlled rate-limit response.
-    gdeltCalls += 1;
-    return new Response("rate limited", { status: 429, headers: { "retry-after": "60", "content-type": "text/plain" } });
+    // Each of the five category-native RSS sources returns a controlled failure; none can block the API.
+    macroRssCalls += 1;
+    return new Response("unavailable", { status: 503, headers: { "content-type": "text/plain" } });
   };
 
   const req = { method: "GET", headers: { "x-macro-request-id": "manual-timeout-001" }, query: { refresh: "1" } };
@@ -59,9 +59,9 @@ async function main() {
     assert.ok(result.payload.criticalMinerals.news.some((item) => item.available), "timeout fallback must retain previous successful news");
   }
   assert.equal(miningCalls, 2, "two concurrent requests must share one second-round macro refresh");
-  assert.equal(gdeltCalls, 2, "the two independent categories must each issue one JSON request without retries");
-  assert.ok(elapsedMs >= 8_500 && elapsedMs < 11_500, `manual wait should be about nine seconds, got ${elapsedMs}ms`);
-  console.log(JSON.stringify({ passed: true, miningCalls, gdeltCalls, elapsedMs, statuses: [first.headers.get("x-macro-refresh-status"), second.headers.get("x-macro-refresh-status")] }, null, 2));
+  assert.equal(macroRssCalls, 10, "two manual rounds must request each of the five independent RSS endpoints once");
+  assert.ok(elapsedMs >= 7_500 && elapsedMs < 10_000, `manual wait should be about eight seconds, got ${elapsedMs}ms`);
+  console.log(JSON.stringify({ passed: true, miningCalls, macroRssCalls, elapsedMs, statuses: [first.headers.get("x-macro-refresh-status"), second.headers.get("x-macro-refresh-status")] }, null, 2));
 }
 
 main().catch((error) => {

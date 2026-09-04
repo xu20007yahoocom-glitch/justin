@@ -174,7 +174,7 @@ export interface AnalysisSourceLink {
 }
 
 /** 真实宏观数据的可点击来源，时间为该来源返回的观测／文章时间。 */
-export type GlobalMacroProvider = "FRED" | "EIA" | "GDELT" | "USGS" | "Mining.com";
+export type GlobalMacroProvider = "FRED" | "EIA" | "GDELT" | "USGS" | "Mining.com" | "BBC News" | "UN News" | "Federal Reserve" | "European Central Bank";
 
 export interface GlobalMacroSource {
   provider: GlobalMacroProvider;

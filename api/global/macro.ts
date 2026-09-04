@@ -1,7 +1,7 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { EIA_MAJOR_ENERGY_COUNTRIES, getEiaCountryEnergy, type EiaCountryEnergy, type EiaEnergyMetric, type EiaResult, type EiaInternationalObservation } from "../../lib/providers/eia.js";
 import { FRED_MAJOR_RATE_DEFINITIONS, getFredCountryRate, getFredLatestObservation, type FredCountryRate, type FredLatestObservation, type FredRateMetric, type FredResult } from "../../lib/providers/fred.js";
-import { getGdeltRecentArticles, type GdeltArticle, type GdeltResult } from "../../lib/providers/gdelt.js";
+import { getMacroRssNews, type MacroRssArticle, type MacroRssCategoryResult } from "../../lib/providers/macro-news-rss.js";
 import { getMiningComMineralNews, MINING_RSS_URL, type MineralRssArticle, type MineralRssResult } from "../../lib/providers/mineral-rss.js";
 import { USGS_CRITICAL_MINERALS_2026, USGS_DATA_YEAR } from "../../lib/data/mineral-reserves.js";
 import type {
@@ -41,8 +41,8 @@ interface ManualRefreshFlight {
   promise: Promise<GlobalMacroReference>;
 }
 let manualRefreshInFlight: ManualRefreshFlight | null = null;
-const MANUAL_REFRESH_TIMEOUT_MS = 9_000;
-const MANUAL_GDELT_DEADLINE_MS = 8_500;
+const MANUAL_REFRESH_TIMEOUT_MS = 8_000;
+const MANUAL_RSS_DEADLINE_MS = 7_500;
 
 function dedupeSources(sources: Array<GlobalMacroSource | null>): GlobalMacroSource[] {
   const seen = new Set<string>();
@@ -140,25 +140,22 @@ function eiaCountryGroup(country: string, result: EiaResult<EiaCountryEnergy> | 
   return { country, updatedAt, items, available: items.some((item) => item.available) };
 }
 
-function gdeltItems(label: string, result: GdeltResult<GdeltArticle[]> | null): GlobalMacroItem[] {
-  const errorCategory = result?.errorCategory ? `错误类别：${result.errorCategory}；` : "";
-  const cacheNotice = result?.cacheStatus === "fresh"
-    ? "缓存状态：新鲜资料；"
-    : result?.cacheStatus === "stale_cooldown"
-      ? "正在使用缓存资料，来源暂时受限；"
-      : result?.cacheStatus === "stale_refreshing"
-        ? "正在使用缓存资料，后台刷新中；"
-        : "";
+function macroRssItems(label: string, result: MacroRssCategoryResult | null): GlobalMacroItem[] {
+  const cacheStatus = result?.cacheStatus === "fresh" ? "fresh" : result?.cacheStatus === "stale" ? "stale" : "unavailable_refreshing";
+  const sourceFailures = result?.sourceResults.filter((source) => source.errorCategory).length ?? 0;
+  const failureNotice = sourceFailures > 0 ? `部分来源更新失败（${sourceFailures}）；` : "";
   if (!result || result.data.length === 0) {
-    const item = unavailableItem(label, "GDELT", "GDELT DOC 2.0", "https://api.gdeltproject.org/api/v2/doc/doc", `${errorCategory}${result?.cacheStatus === "unavailable_cooldown" ? "来源暂时受限；" : ""}GDELT 未返回可验证新闻；非实时，定期更新`);
-    return [{ ...item, cacheUpdatedAt: result?.fetchedAt ?? null, cacheStatus: result?.cacheStatus }];
+    return [{
+      label, value: UNAVAILABLE_TEXT, unit: null, dataTime: null, source: null,
+      note: `${failureNotice}${result?.errorCategory ? `错误类别：${result.errorCategory}；` : ""}多来源 RSS 未返回可验证新闻；非实时，定期更新`,
+      cacheUpdatedAt: result?.fetchedAt ?? null, cacheStatus, available: false
+    }];
   }
-  const transport = result.sourceFormat === "rss" ? "GDELT RSS fallback" : "GDELT JSON";
-  return result.data.map((article) => ({
-    label: article.title, value: article.domain ? `新闻来源：${article.domain}` : "新闻来源链接可用", unit: null, dataTime: article.seenAt,
-    source: { provider: "GDELT", title: article.title, url: article.url, dataTime: article.seenAt },
-    note: `类别：${label}；${cacheNotice}${result.isStale ? "服务端旧缓存；" : ""}${transport} 新闻索引，非实时，定期更新`,
-    cacheUpdatedAt: result.fetchedAt, cacheStatus: result.cacheStatus, available: true
+  return result.data.map((article: MacroRssArticle) => ({
+    label: article.title, value: `新闻来源：${article.sourceName}`, unit: null, dataTime: article.publishedAt,
+    source: { provider: article.sourceName, title: article.sourceName, url: article.url, dataTime: article.publishedAt },
+    note: `类别：${label}；${failureNotice}${result.isStale ? "服务端旧缓存；" : ""}${article.sourceName} RSS 原始标题；非实时，定期更新`,
+    cacheUpdatedAt: result.fetchedAt, cacheStatus, available: true
   }));
 }
 
@@ -194,11 +191,11 @@ function unavailableEnergyGroups(): GlobalMacroCountryGroup[] {
 }
 
 function macroResponseCacheControl(value: GlobalMacroReference): string {
-  const hasUnavailableGdelt = value.geopoliticalNews.items.some((item) => !item.available);
+  const hasUnavailableRssNews = value.geopoliticalNews.items.some((item) => !item.available);
   const hasUnavailableMiningNews = value.criticalMinerals.news.some((item) => !item.available);
   // A stale or unavailable news category must revalidate quickly. CDN SWR serves the current
-  // response immediately while coalescing revalidation, so a visitor never waits for GDELT.
-  return hasUnavailableGdelt || hasUnavailableMiningNews || value.isStale
+  // response immediately while coalescing revalidation, so a visitor never waits for RSS refreshes.
+  return hasUnavailableRssNews || hasUnavailableMiningNews || value.isStale
     ? "s-maxage=60, stale-while-revalidate=300"
     : "s-maxage=1800, stale-while-revalidate=3600";
 }
@@ -213,7 +210,7 @@ function unavailable(reason: string): GlobalMacroReference {
   ]);
   const countryEnergy = countrySection("各国能源使用量", unavailableEnergyGroups(), "EIA International 动态 metadata／facet 发现；年度数据，非实时，定期更新");
   const centralBankRates = countrySection("央行利率", unavailableRateGroups(), "FRED 动态 series 搜索与 observations 核验；非实时，定期更新");
-  const geopoliticalNews = section("地缘政治／全球新闻", [unavailableItem("近期地缘政治与全球新闻", "GDELT", "GDELT DOC 2.0", "https://api.gdeltproject.org/api/v2/doc/doc", "非实时，定期更新")]);
+  const geopoliticalNews = section("地缘政治／全球新闻", [{ label: "近期地缘政治与经济相关新闻", value: UNAVAILABLE_TEXT, unit: null, dataTime: null, source: null, note: "多来源 RSS 新闻暂不可用；非实时，定期更新", available: false }]);
   return {
     available: criticalMinerals.minerals.some((mineral) => mineral.available), dataNature: DATA_NATURE, generatedAt: new Date().toISOString(), cachedAt: null, isStale: false,
     sources: dedupeSources([...criticalMinerals.sources, ...preciousMetals.sources, ...energyPrices.sources, ...countryEnergy.sources, ...centralBankRates.sources, ...geopoliticalNews.sources]),
@@ -305,12 +302,12 @@ async function mapWithConcurrency<T, R>(values: readonly T[], limit: number, map
   return results;
 }
 
-async function generateMacro(forceRefresh = false, manualGdelt: { requestId: string; refreshId: string; invocationStartedAt: string; deadlineAt: number } | null = null): Promise<GlobalMacroReference> {
+async function generateMacro(forceRefresh = false, manualRss: { requestId: string; refreshId: string; invocationStartedAt: string; deadlineAt: number } | null = null): Promise<GlobalMacroReference> {
   try {
-    // For refresh=1, both categories await their real DOC API operation. Normal loads retain SWR.
-    const gdeltPromise = Promise.allSettled([
-      getGdeltRecentArticles("geopolitical", { forceRefresh, awaitRefresh: Boolean(manualGdelt), requestId: manualGdelt?.requestId, refreshId: manualGdelt?.refreshId, invocationStartedAt: manualGdelt?.invocationStartedAt, deadlineAt: manualGdelt?.deadlineAt }),
-      getGdeltRecentArticles("economic", { forceRefresh, awaitRefresh: Boolean(manualGdelt), requestId: manualGdelt?.requestId, refreshId: manualGdelt?.refreshId, invocationStartedAt: manualGdelt?.invocationStartedAt, deadlineAt: manualGdelt?.deadlineAt })
+    // Manual refresh awaits both category-native RSS aggregates; normal loads remain cache-first/SWR.
+    const rssPromise = Promise.allSettled([
+      getMacroRssNews("geopolitical", { forceRefresh, awaitRefresh: Boolean(manualRss), requestId: manualRss?.requestId, refreshId: manualRss?.refreshId, invocationStartedAt: manualRss?.invocationStartedAt, deadlineAt: manualRss?.deadlineAt }),
+      getMacroRssNews("economic", { forceRefresh, awaitRefresh: Boolean(manualRss), requestId: manualRss?.requestId, refreshId: manualRss?.refreshId, invocationStartedAt: manualRss?.invocationStartedAt, deadlineAt: manualRss?.deadlineAt })
     ]);
     const mineralPromise = getMiningComMineralNews({ forceRefresh });
     const [wti, brent, henryHub, rateResults, energyResults] = await Promise.all([
@@ -320,7 +317,7 @@ async function generateMacro(forceRefresh = false, manualGdelt: { requestId: str
       mapWithConcurrency(FRED_MAJOR_RATE_DEFINITIONS, 2, (definition) => getFredCountryRate(definition, { forceRefresh })),
       mapWithConcurrency(EIA_MAJOR_ENERGY_COUNTRIES, 1, (definition) => getEiaCountryEnergy(definition, { forceRefresh }))
     ]);
-    const [geopoliticalSettled, economicSettled] = await gdeltPromise;
+    const [geopoliticalSettled, economicSettled] = await rssPromise;
     const mineralNews = await mineralPromise;
     const geopolitical = geopoliticalSettled.status === "fulfilled" ? geopoliticalSettled.value : null;
     const economicNews = economicSettled.status === "fulfilled" ? economicSettled.value : null;
@@ -341,7 +338,7 @@ async function generateMacro(forceRefresh = false, manualGdelt: { requestId: str
       FRED_MAJOR_RATE_DEFINITIONS.map((definition, index) => fredCountryGroup(definition.country, rateResults[index])),
       "FRED 动态 series 搜索后再以 observations 核验；每项保留 FRED 原始单位与观测时间；非实时，定期更新"
     );
-    const geopoliticalNews = section("地缘政治／全球新闻", [...gdeltItems("地缘政治新闻", geopolitical), ...gdeltItems("经济相关新闻", economicNews)], "GDELT 新闻索引；仅展示来源文章元数据，非实时，定期更新");
+    const geopoliticalNews = section("地缘政治／全球新闻", [...macroRssItems("地缘政治新闻", geopolitical), ...macroRssItems("经济相关新闻", economicNews)], "BBC News、UN News、Federal Reserve 与 European Central Bank 的 RSS 原始文章元数据；非实时，定期更新");
     const sources = dedupeSources([...criticalMinerals.sources, ...preciousMetals.sources, ...energyPrices.sources, ...countryEnergy.sources, ...centralBankRates.sources, ...geopoliticalNews.sources]);
     const allCountryItems = [...(countryEnergy.countries ?? []).flatMap((country) => country.items), ...(centralBankRates.countries ?? []).flatMap((country) => country.items)];
     const allResults = [wti, brent, henryHub, geopolitical, economicNews, mineralNews, ...rateResults, ...energyResults];
@@ -353,7 +350,7 @@ async function generateMacro(forceRefresh = false, manualGdelt: { requestId: str
       unavailableReason: available ? null : "所有数据源暂时不可用或未配置相应密钥"
     };
     // A missing news category gets a short macro cache so it can recover without holding empty cards for 30 minutes.
-    const hasNews = (result: GdeltResult<GdeltArticle[]> | MineralRssResult<MineralRssArticle[]> | null): boolean => Boolean(result?.data.length);
+    const hasNews = (result: { data: readonly unknown[] } | null): boolean => Boolean(result?.data.length);
     const cacheTtl = hasNews(geopolitical) && hasNews(economicNews) && hasNews(mineralNews) && !value.isStale
       ? MACRO_CACHE_TTL_MS
       : MACRO_NEWS_RETRY_TTL_MS;
@@ -368,16 +365,12 @@ async function generateMacro(forceRefresh = false, manualGdelt: { requestId: str
   }
 }
 
-function hasGdeltCooldown(value: GlobalMacroReference): boolean {
-  return value.geopoliticalNews.items.some((item) => item.note.includes("来源暂时受限"));
-}
-
 function refreshStatus(value: GlobalMacroReference): "updated" | "partial" | "gdelt_cooldown" {
-  if (hasGdeltCooldown(value)) return "gdelt_cooldown";
   // Gold is intentionally unavailable because the prior FRED LMBA series was removed;
   // it must not make every otherwise successful manual refresh appear partial.
   const sections = [value.energyPrices, value.countryEnergy, value.centralBankRates, value.geopoliticalNews];
-  const incomplete = sections.some((entry) => entry.items.some((item) => !item.available)) || value.isStale;
+  const hasPartialRssFailure = value.geopoliticalNews.items.some((item) => item.note.includes("部分来源更新失败"));
+  const incomplete = sections.some((entry) => entry.items.some((item) => !item.available)) || value.isStale || hasPartialRssFailure;
   return incomplete ? "partial" : "updated";
 }
 
@@ -391,8 +384,8 @@ function startManualRefresh(requestId: string, invocationStartedAt: string): Man
     return manualRefreshInFlight;
   }
   const refreshId = createRefreshId();
-  const deadlineAt = Date.now() + MANUAL_GDELT_DEADLINE_MS;
-  console.info("MACRO_MANUAL_REFRESH", { requestId, refreshId, invocationStartedAt, outcome: "started", gdeltDeadlineMs: MANUAL_GDELT_DEADLINE_MS });
+  const deadlineAt = Date.now() + MANUAL_RSS_DEADLINE_MS;
+  console.info("MACRO_MANUAL_REFRESH", { requestId, refreshId, invocationStartedAt, outcome: "started", rssDeadlineMs: MANUAL_RSS_DEADLINE_MS });
   const promise = generateMacro(true, { requestId, refreshId, invocationStartedAt, deadlineAt }).finally(() => { manualRefreshInFlight = null; });
   manualRefreshInFlight = { refreshId, promise };
   return manualRefreshInFlight;

@@ -7,6 +7,7 @@ const fred = readFileSync(new URL("./lib/providers/fred.ts", import.meta.url), "
 const eia = readFileSync(new URL("./lib/providers/eia.ts", import.meta.url), "utf8");
 const gdelt = readFileSync(new URL("./lib/providers/gdelt.ts", import.meta.url), "utf8");
 const mining = readFileSync(new URL("./lib/providers/mineral-rss.ts", import.meta.url), "utf8");
+const macroRss = readFileSync(new URL("./lib/providers/macro-news-rss.ts", import.meta.url), "utf8");
 const requestClient = readFileSync(new URL("./src/lib/globalMacroRequest.ts", import.meta.url), "utf8");
 
 const assertions = {
@@ -22,12 +23,18 @@ const assertions = {
   frontend_exposes_news_cache_metadata: component.includes("缓存更新时间：{formatTime(item.cacheUpdatedAt)}") && component.includes("缓存状态：{cacheStatusLabel[item.cacheStatus]}"),
   backend_recognizes_refresh_parameter: macro.includes("function isRefreshRequest") && macro.includes('value === "1"'),
   backend_records_request_and_invocation_ids: macro.includes("function requestIdFor") && macro.includes('console.info("MACRO_REQUEST"') && macro.includes("invocationStartedAt"),
-  backend_has_nine_second_limit: macro.includes("MANUAL_REFRESH_TIMEOUT_MS = 9_000"),
+  backend_has_eight_second_limit: macro.includes("MANUAL_REFRESH_TIMEOUT_MS = 8_000") && macro.includes("MANUAL_RSS_DEADLINE_MS = 7_500"),
   backend_clears_wait_timer: macro.includes("clearTimeout(timer)"),
   backend_single_flight: macro.includes("let manualRefreshInFlight") && macro.includes("if (manualRefreshInFlight) {") && macro.includes("return manualRefreshInFlight;"),
   backend_manual_response_is_not_cached: macro.includes('res.setHeader("Cache-Control", "private, no-store")'),
   backend_merges_previous_sections: macro.includes("function mergeWithPrevious") && macro.includes("mergeItemsWithPrevious") && macro.includes("mergeNewsSectionWithPrevious"),
-  backend_forces_each_provider_cache_path: macro.includes('getFredLatestObservation("DCOILWTICO", { forceRefresh })') && macro.includes('getEiaCountryEnergy(definition, { forceRefresh })') && macro.includes('getGdeltRecentArticles("geopolitical", { forceRefresh, awaitRefresh: Boolean(manualGdelt)') && macro.includes('getMiningComMineralNews({ forceRefresh })'),
+  backend_forces_each_provider_cache_path: macro.includes('getFredLatestObservation("DCOILWTICO", { forceRefresh })') && macro.includes('getEiaCountryEnergy(definition, { forceRefresh })') && macro.includes('getMacroRssNews("geopolitical", { forceRefresh, awaitRefresh: Boolean(manualRss)') && macro.includes('getMacroRssNews("economic", { forceRefresh, awaitRefresh: Boolean(manualRss)') && macro.includes('getMiningComMineralNews({ forceRefresh })'),
+  macro_rss_replaces_gdelt_as_production_mapping: macro.includes("function macroRssItems") && !macro.includes("getGdeltRecentArticles") && !macro.includes("GDELT DOC 2.0"),
+  macro_rss_has_exact_five_configured_endpoints: ["https://feeds.bbci.co.uk/news/world/rss.xml", "https://news.un.org/feed/subscribe/en/news/all/rss.xml", "https://feeds.bbci.co.uk/news/business/rss.xml", "https://www.federalreserve.gov/feeds/press_all.xml", "https://www.ecb.europa.eu/rss/press.html"].every((endpoint) => macroRss.includes(endpoint)),
+  macro_rss_fetches_sources_in_parallel_with_timeouts: macroRss.includes("Promise.allSettled(sources.map") && macroRss.includes("const SOURCE_TIMEOUT_MS = 6_000") && macroRss.includes("new AbortController()") && macroRss.includes('cache: "no-store"'),
+  macro_rss_cache_preserves_last_known_good: macroRss.includes("const FRESH_TTL_MS = 15 * 60 * 1_000") && macroRss.includes("const STALE_TTL_MS = 24 * 60 * 60 * 1_000") && macroRss.includes("if (result.articles) return cacheSourceSuccess") && macroRss.includes("if (data.length) return cacheCategorySuccess"),
+  macro_rss_filters_only_title_and_http_link: macroRss.includes("if (!title || !url) continue") && macroRss.includes("Publication") === false && macroRss.includes("Only title and an original HTTP(S) link are mandatory"),
+  macro_rss_diagnostics_are_safe_and_complete: macroRss.includes('console.info("MACRO_RSS_DIAGNOSTIC"') && macroRss.includes("responseTextLength") && macroRss.includes("rawCount") && macroRss.includes("parsedCount") && macroRss.includes("filteredCount") && macroRss.includes("errorCategory"),
   fred_force_refresh_preserves_lkg: fred.includes("export interface FredRefreshOptions") && fred.includes("fresh && options.forceRefresh ? { ...fresh, isStale: true }") && fred.includes("if (!fallback) cacheValue(key, null, FAILURE_TTL_MS, null)"),
   eia_force_refresh_preserves_lkg: eia.includes("export interface EiaRefreshOptions") && eia.includes("fresh && options.forceRefresh ? { ...fresh, isStale: true }") && eia.includes("if (!fallback) cacheValue(key, null, FAILURE_TTL_MS, null)"),
   gdelt_force_refresh_respects_cooldown: gdelt.includes("export interface GdeltRefreshOptions") && gdelt.includes("awaitRefresh?: boolean") && gdelt.includes("await getOrStartRefresh(key, category, options)") && gdelt.includes("waitUntil(operation)") && gdelt.includes("const reusableEntry = stale ?? (options.forceRefresh ? cache.get(key) ?? null : null)"),
