@@ -2,6 +2,9 @@ import { waitUntil } from "@vercel/functions";
 
 const GDELT_DOC_URL = "https://api.gdeltproject.org/api/v2/doc/doc";
 const REQUEST_TIMEOUT_MS = 12_000;
+const MANUAL_PROVIDER_TIMEOUT_MS = 6_000;
+const MANUAL_JOIN_MAX_AGE_MS = 3_000;
+const MANUAL_JOIN_MIN_REMAINING_MS = 3_000;
 const MIN_REQUEST_INTERVAL_MS = 5_200;
 const SUCCESS_TTL_MS = 30 * 60 * 1_000;
 const STALE_TTL_MS = 24 * 60 * 60 * 1_000;
@@ -40,9 +43,12 @@ interface CacheEntry<T> {
   sourceFormat: GdeltSourceFormat;
 }
 
+type GdeltCooldownReason = "http_429" | "rate_limited_content" | "timeout" | "network_error" | "parse_error" | "empty";
+
 interface FailureCacheEntry {
   until: number;
   outcome: GdeltOutcome;
+  cooldownReason: GdeltCooldownReason;
 }
 
 export type GdeltOutcome =
@@ -85,7 +91,7 @@ export interface GdeltRefreshOptions {
   deadlineAt?: number;
 }
 
-export type GdeltRefreshFinalOutcome = "refresh_succeeded" | "refresh_rate_limited" | "refresh_timeout" | "refresh_network_error" | "refresh_parse_error" | "refresh_empty";
+export type GdeltRefreshFinalOutcome = "refresh_succeeded" | "refresh_rate_limited" | "refresh_cooldown" | "refresh_network_error" | "refresh_parse_error" | "refresh_empty";
 
 export interface GdeltArticle {
   title: string;
@@ -116,14 +122,27 @@ interface RefreshOperationResult {
   finalOutcome: GdeltRefreshFinalOutcome;
   elapsedMs: number;
   cacheWriteSucceeded: boolean;
+  cooldownReason: GdeltCooldownReason | null;
+  lastFailureStatus: GdeltOutcome | null;
+}
+
+interface InFlightEntry {
+  promise: Promise<RefreshOperationResult>;
+  controller: AbortController;
+  startedAt: number;
+  deadlineAt: number;
+  category: GdeltNewsCategory;
+  settled: boolean;
+  abortReason: "deadline" | "superseded_by_manual" | null;
 }
 
 const cache = new Map<string, CacheEntry<GdeltArticle[]>>();
 const failureCache = new Map<string, FailureCacheEntry>();
-const inFlight = new Map<string, Promise<RefreshOperationResult>>();
+const inFlight = new Map<string, InFlightEntry>();
 let requestQueue: Promise<void> = Promise.resolve();
 let nextRequestAt = 0;
 let providerCooldownUntil = 0;
+let providerCooldownReason: "http_429" | "rate_limited_content" | null = null;
 
 function text(value: unknown, limit = 500): string | null {
   return typeof value === "string" && value.trim() ? value.trim().slice(0, limit) : null;
@@ -211,6 +230,52 @@ function errorCategory(error: unknown): "timeout" | "network_error" {
   return error instanceof Error && error.name === "AbortError" ? "timeout" : "network_error";
 }
 
+function safeErrorText(value: unknown): string | null {
+  if (typeof value !== "string" || !value.trim()) return null;
+  return value.replace(/(?:api[_-]?key|token|authorization)=?[^\s&]+/gi, "$1=<redacted>").slice(0, 240);
+}
+
+function networkDiagnostics(error: unknown): Record<string, string | number | null> {
+  const candidate = error && typeof error === "object" ? error as Record<string, unknown> : {};
+  const cause = candidate.cause && typeof candidate.cause === "object" ? candidate.cause as Record<string, unknown> : {};
+  const errorName = typeof candidate.name === "string" ? candidate.name : "UnknownError";
+  const errorCode = typeof candidate.code === "string" ? candidate.code : null;
+  const causeCode = typeof cause.code === "string" ? cause.code : null;
+  const code = causeCode ?? errorCode;
+  const phase = errorName === "AbortError" ? "abort"
+    : code === "ENOTFOUND" ? "dns"
+      : code === "UND_ERR_HEADERS_TIMEOUT" ? "headers"
+        : code === "UND_ERR_BODY_TIMEOUT" ? "body"
+          : code === "UND_ERR_CONNECT_TIMEOUT" || code === "ETIMEDOUT" || code === "ECONNREFUSED" || code === "ECONNRESET" ? "connect"
+            : /TLS|SSL|CERT|UNABLE_TO_VERIFY/i.test(code ?? "") ? "tls" : "request";
+  const addressFamily = typeof cause.family === "number" || typeof cause.family === "string" ? cause.family
+    : typeof candidate.family === "number" || typeof candidate.family === "string" ? candidate.family : null;
+  return {
+    errorName,
+    errorCode,
+    causeCode,
+    causeMessage: safeErrorText(cause.message) ?? safeErrorText(candidate.message),
+    networkPhase: phase,
+    addressFamily
+  };
+}
+
+function elapsedFromProviderTimes(providerStartedAt: string | null | undefined, providerEndedAt: string | null | undefined): number {
+  if (!providerStartedAt || !providerEndedAt) return 0;
+  const start = Date.parse(providerStartedAt);
+  const end = Date.parse(providerEndedAt);
+  return Number.isFinite(start) && Number.isFinite(end) ? Math.max(0, end - start) : 0;
+}
+
+function cooldownReasonFor(outcome: GdeltOutcome): GdeltCooldownReason {
+  if (outcome === "http_429") return "http_429";
+  if (outcome === "rate_limited_content") return "rate_limited_content";
+  if (outcome === "timeout") return "timeout";
+  if (outcome === "http_200_non_json") return "parse_error";
+  if (outcome === "articles_empty" || outcome === "articles_filtered_empty") return "empty";
+  return "network_error";
+}
+
 function looksLikeGdeltRateLimit(raw: string): boolean {
   return /please limit requests to one every\s+\d+\s+seconds|high-traffic users should switch/i.test(raw);
 }
@@ -273,30 +338,26 @@ function parseRssArticles(xml: string): { rawCount: number; articles: GdeltArtic
   return { rawCount: blocks.length, articles };
 }
 
-async function requestAttempt(category: GdeltNewsCategory, sourceFormat: GdeltSourceFormat, attempt: number, options: GdeltRefreshOptions = {}): Promise<RequestResult> {
-  const startedAt = Date.now();
+async function requestAttempt(category: GdeltNewsCategory, sourceFormat: GdeltSourceFormat, attempt: number, options: GdeltRefreshOptions, entry: InFlightEntry): Promise<RequestResult> {
   const url = buildUrl(category, sourceFormat);
   const rateLimitWaitMs = await reserveRequestSlot(Boolean(options.awaitRefresh));
-  const remainingMs = options.deadlineAt ? Math.max(0, options.deadlineAt - Date.now()) : REQUEST_TIMEOUT_MS;
-  const timeoutMs = Math.min(REQUEST_TIMEOUT_MS, remainingMs || 1);
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
-  const base = { requestId: options.requestId ?? null, refreshId: options.refreshId ?? null, invocationStartedAt: options.invocationStartedAt ?? null, category, query: CATEGORY_QUERY[category], sourceFormat, requestUrl: url.toString(), attempt, timeoutMs, rateLimitWaitMs };
-  if (options.deadlineAt && remainingMs <= 0) {
-    clearTimeout(timeout);
-    diagnostic({ ...base, event: "provider_request_failed", outcome: "timeout", httpStatus: null, contentType: null, responseTextLength: 0, topLevelFields: [], articlesIsArray: false, rawArticleCount: 0, filteredArticleCount: 0, elapsedMs: Date.now() - startedAt, errorName: "DeadlineExceeded", errorMessage: "manual refresh deadline elapsed before request start", errorCategory: "timeout" });
-    return { articles: null, retryOnTimeout: false, allowRssFallback: false, sourceFormat, outcome: "timeout", cooldownMs: null, httpStatus: null, rawArticleCount: 0, filteredArticleCount: 0, providerStartedAt: null, providerEndedAt: new Date().toISOString() };
+  const remainingMs = Math.max(0, entry.deadlineAt - Date.now());
+  const inFlightAgeMs = Math.max(0, Date.now() - entry.startedAt);
+  const base = { requestId: options.requestId ?? null, refreshId: options.refreshId ?? null, invocationStartedAt: options.invocationStartedAt ?? null, category, query: CATEGORY_QUERY[category], sourceFormat, requestUrl: url.toString(), attempt, timeoutMs: Math.max(0, entry.deadlineAt - entry.startedAt), rateLimitWaitMs, inFlightAgeMs, remainingMs };
+  if (remainingMs <= 0 || entry.controller.signal.aborted) {
+    const providerEndedAt = new Date().toISOString();
+    diagnostic({ ...base, event: "provider_request_failed", outcome: "timeout", providerStartedAt: null, providerEndedAt, httpStatus: null, contentType: null, responseTextLength: 0, topLevelFields: [], articlesIsArray: false, rawArticleCount: 0, filteredArticleCount: 0, elapsedMs: 0, errorName: "AbortError", errorCode: null, causeCode: null, causeMessage: "provider deadline elapsed before request start", networkPhase: "abort", addressFamily: null, errorCategory: "timeout" });
+    return { articles: null, retryOnTimeout: false, allowRssFallback: false, sourceFormat, outcome: "timeout", cooldownMs: null, httpStatus: null, rawArticleCount: 0, filteredArticleCount: 0, providerStartedAt: null, providerEndedAt };
   }
-  // Another queued category may have received Retry-After while this request waited.
-  // Do not send a new JSON or RSS request until that provider-level cooldown expires.
+  // A provider cooldown is only created from a verified 429/rate-limit response, never from timeout.
   if (Date.now() < providerCooldownUntil) {
-    clearTimeout(timeout);
-    diagnostic({ ...base, outcome: "rate_limited_content", httpStatus: null, contentType: null, responseTextLength: 0, topLevelFields: [], articlesIsArray: false, rawArticleCount: 0, filteredArticleCount: 0, cooldownUntil: providerCooldownUntil, errorCategory: "rate_limited_content" });
-    return { articles: null, retryOnTimeout: false, allowRssFallback: false, sourceFormat, outcome: "rate_limited_content", cooldownMs: providerCooldownUntil - Date.now(), httpStatus: null, rawArticleCount: 0, filteredArticleCount: 0, providerStartedAt: null, providerEndedAt: new Date().toISOString() };
+    const providerEndedAt = new Date().toISOString();
+    diagnostic({ ...base, event: "provider_request_blocked", outcome: "rate_limited_content", providerStartedAt: null, providerEndedAt, httpStatus: null, contentType: null, responseTextLength: 0, topLevelFields: [], articlesIsArray: false, rawArticleCount: 0, filteredArticleCount: 0, elapsedMs: 0, cooldownUntil: providerCooldownUntil, cooldownReason: providerCooldownReason, errorCategory: "rate_limited_content" });
+    return { articles: null, retryOnTimeout: false, allowRssFallback: false, sourceFormat, outcome: "rate_limited_content", cooldownMs: providerCooldownUntil - Date.now(), httpStatus: null, rawArticleCount: 0, filteredArticleCount: 0, providerStartedAt: null, providerEndedAt };
   }
 
   const providerStartedAt = new Date().toISOString();
-  diagnostic({ ...base, event: "provider_request_started", outcome: "request_started", providerStartedAt, providerEndedAt: null, httpStatus: null, contentType: null, responseTextLength: 0, topLevelFields: [], articlesIsArray: false, rawArticleCount: 0, filteredArticleCount: 0, elapsedMs: Date.now() - startedAt, errorCategory: null });
+  diagnostic({ ...base, event: "provider_request_started", outcome: "request_started", providerStartedAt, providerEndedAt: null, httpStatus: null, contentType: null, responseTextLength: 0, topLevelFields: [], articlesIsArray: false, rawArticleCount: 0, filteredArticleCount: 0, elapsedMs: 0, errorCategory: null });
   try {
     const response = await fetch(url.toString(), {
       method: "GET",
@@ -305,33 +366,37 @@ async function requestAttempt(category: GdeltNewsCategory, sourceFormat: GdeltSo
         Accept: sourceFormat === "json" ? "application/json" : "application/rss+xml, application/xml;q=0.9, text/xml;q=0.8",
         "User-Agent": "justin-stock-analysis-news/1.0"
       },
-      signal: controller.signal
+      signal: entry.controller.signal
     });
     const raw = await response.text();
     const contentType = response.headers.get("content-type") ?? null;
     const providerEndedAt = new Date().toISOString();
-    diagnostic({ ...base, event: "provider_response_received", outcome: "response_received", providerStartedAt, providerEndedAt, httpStatus: response.status, contentType, responseTextLength: raw.length, topLevelFields: [], articlesIsArray: false, rawArticleCount: 0, filteredArticleCount: 0, elapsedMs: Date.now() - startedAt, errorCategory: null });
+    const elapsedMs = elapsedFromProviderTimes(providerStartedAt, providerEndedAt);
+    diagnostic({ ...base, event: "provider_response_received", outcome: "response_received", providerStartedAt, providerEndedAt, httpStatus: response.status, contentType, responseTextLength: raw.length, topLevelFields: [], articlesIsArray: false, rawArticleCount: 0, filteredArticleCount: 0, elapsedMs, errorCategory: null });
 
     if (!response.ok) {
       const outcome = outcomeForHttpStatus(response.status);
       const cooldownMs = outcome === "http_429" ? parseRetryAfter(response.headers.get("retry-after")) : null;
-      if (cooldownMs !== null) providerCooldownUntil = Math.max(providerCooldownUntil, Date.now() + cooldownMs);
-      diagnostic({ ...base, outcome, httpStatus: response.status, contentType, responseTextLength: raw.length, topLevelFields: [], articlesIsArray: false, rawArticleCount: 0, filteredArticleCount: 0, retryAfterMs: cooldownMs, errorCategory: outcome });
-      // HTTP failures, especially 429, never trigger another request in this refresh.
+      if (cooldownMs !== null) {
+        providerCooldownUntil = Math.max(providerCooldownUntil, Date.now() + cooldownMs);
+        providerCooldownReason = "http_429";
+      }
+      diagnostic({ ...base, outcome, providerStartedAt, providerEndedAt, httpStatus: response.status, contentType, responseTextLength: raw.length, topLevelFields: [], articlesIsArray: false, rawArticleCount: 0, filteredArticleCount: 0, elapsedMs, retryAfterMs: cooldownMs, cooldownReason: cooldownMs ? "http_429" : null, errorCategory: outcome });
       return { articles: null, retryOnTimeout: false, allowRssFallback: false, sourceFormat, outcome, cooldownMs, httpStatus: response.status, rawArticleCount: 0, filteredArticleCount: 0, providerStartedAt, providerEndedAt };
     }
 
     if (looksLikeGdeltRateLimit(raw)) {
       const outcome: GdeltOutcome = "rate_limited_content";
       providerCooldownUntil = Math.max(providerCooldownUntil, Date.now() + DEFAULT_RETRY_AFTER_MS);
-      diagnostic({ ...base, outcome, httpStatus: response.status, contentType, responseTextLength: raw.length, topLevelFields: [], articlesIsArray: false, rawArticleCount: 0, filteredArticleCount: 0, retryAfterMs: DEFAULT_RETRY_AFTER_MS, errorCategory: outcome });
+      providerCooldownReason = "rate_limited_content";
+      diagnostic({ ...base, outcome, providerStartedAt, providerEndedAt, httpStatus: response.status, contentType, responseTextLength: raw.length, topLevelFields: [], articlesIsArray: false, rawArticleCount: 0, filteredArticleCount: 0, elapsedMs, retryAfterMs: DEFAULT_RETRY_AFTER_MS, cooldownReason: "rate_limited_content", errorCategory: outcome });
       return { articles: null, retryOnTimeout: false, allowRssFallback: false, sourceFormat, outcome, cooldownMs: DEFAULT_RETRY_AFTER_MS, httpStatus: response.status, rawArticleCount: 0, filteredArticleCount: 0, providerStartedAt, providerEndedAt };
     }
 
     if (sourceFormat === "rss") {
       const parsed = parseRssArticles(raw);
       const outcome: GdeltOutcome = parsed.rawCount === 0 ? "articles_empty" : parsed.articles.length === 0 ? "articles_filtered_empty" : "rss_fallback_success";
-      diagnostic({ ...base, outcome, httpStatus: response.status, contentType, responseTextLength: raw.length, topLevelFields: [], articlesIsArray: false, rawArticleCount: parsed.rawCount, filteredArticleCount: parsed.articles.length, errorCategory: outcome === "rss_fallback_success" ? null : outcome });
+      diagnostic({ ...base, outcome, providerStartedAt, providerEndedAt, httpStatus: response.status, contentType, responseTextLength: raw.length, topLevelFields: [], articlesIsArray: false, rawArticleCount: parsed.rawCount, filteredArticleCount: parsed.articles.length, elapsedMs, errorCategory: outcome === "rss_fallback_success" ? null : outcome });
       return { articles: parsed.articles.length ? parsed.articles : null, retryOnTimeout: false, allowRssFallback: false, sourceFormat, outcome, cooldownMs: null, httpStatus: response.status, rawArticleCount: parsed.rawCount, filteredArticleCount: parsed.articles.length, providerStartedAt, providerEndedAt };
     }
 
@@ -340,7 +405,7 @@ async function requestAttempt(category: GdeltNewsCategory, sourceFormat: GdeltSo
       body = JSON.parse(raw) as GdeltResponse;
     } catch {
       const outcome: GdeltOutcome = "http_200_non_json";
-      diagnostic({ ...base, outcome, httpStatus: response.status, contentType, responseTextLength: raw.length, topLevelFields: [], articlesIsArray: false, rawArticleCount: 0, filteredArticleCount: 0, errorCategory: outcome });
+      diagnostic({ ...base, outcome, providerStartedAt, providerEndedAt, httpStatus: response.status, contentType, responseTextLength: raw.length, topLevelFields: [], articlesIsArray: false, rawArticleCount: 0, filteredArticleCount: 0, elapsedMs, errorCategory: outcome });
       return { articles: null, retryOnTimeout: false, allowRssFallback: true, sourceFormat, outcome, cooldownMs: null, httpStatus: response.status, rawArticleCount: 0, filteredArticleCount: 0, providerStartedAt, providerEndedAt };
     }
 
@@ -349,29 +414,29 @@ async function requestAttempt(category: GdeltNewsCategory, sourceFormat: GdeltSo
     const rows = articlesIsArray ? body.articles as GdeltArticleRow[] : [];
     const articles = rows.map(mapArticle).filter((article): article is GdeltArticle => article !== null).slice(0, MAX_ARTICLES);
     const outcome: GdeltOutcome = rows.length === 0 ? "articles_empty" : articles.length === 0 ? "articles_filtered_empty" : "success";
-    diagnostic({ ...base, outcome, httpStatus: response.status, contentType, responseTextLength: raw.length, topLevelFields, articlesIsArray, rawArticleCount: rows.length, filteredArticleCount: articles.length, errorCategory: outcome === "success" ? null : outcome });
+    diagnostic({ ...base, outcome, providerStartedAt, providerEndedAt, httpStatus: response.status, contentType, responseTextLength: raw.length, topLevelFields, articlesIsArray, rawArticleCount: rows.length, filteredArticleCount: articles.length, elapsedMs, errorCategory: outcome === "success" ? null : outcome });
     return { articles: articles.length ? articles : null, retryOnTimeout: false, allowRssFallback: false, sourceFormat, outcome, cooldownMs: null, httpStatus: response.status, rawArticleCount: rows.length, filteredArticleCount: articles.length, providerStartedAt, providerEndedAt };
   } catch (error) {
     const outcome = errorCategory(error);
-    const errorName = error instanceof Error ? error.name : "UnknownError";
-    const errorMessage = error instanceof Error ? error.message.replace(/(?:api[_-]?key|token|authorization)=?[^\s&]+/gi, "$1=<redacted>").slice(0, 240) : "unknown request failure";
-    diagnostic({ ...base, event: "provider_request_failed", outcome, httpStatus: null, contentType: null, responseTextLength: 0, topLevelFields: [], articlesIsArray: false, rawArticleCount: 0, filteredArticleCount: 0, elapsedMs: Date.now() - startedAt, errorName, errorMessage, errorCategory: outcome });
-    return { articles: null, retryOnTimeout: false, allowRssFallback: false, sourceFormat, outcome, cooldownMs: null, httpStatus: null, rawArticleCount: 0, filteredArticleCount: 0, providerStartedAt, providerEndedAt: new Date().toISOString() };
-  } finally {
-    clearTimeout(timeout);
+    const providerEndedAt = new Date().toISOString();
+    const elapsedMs = elapsedFromProviderTimes(providerStartedAt, providerEndedAt);
+    diagnostic({ ...base, event: "provider_request_failed", outcome, providerStartedAt, providerEndedAt, httpStatus: null, contentType: null, responseTextLength: 0, topLevelFields: [], articlesIsArray: false, rawArticleCount: 0, filteredArticleCount: 0, elapsedMs, ...networkDiagnostics(error), errorCategory: outcome });
+    return { articles: null, retryOnTimeout: false, allowRssFallback: false, sourceFormat, outcome, cooldownMs: null, httpStatus: null, rawArticleCount: 0, filteredArticleCount: 0, providerStartedAt, providerEndedAt };
   }
 }
 
-async function requestArticles(category: GdeltNewsCategory, options: GdeltRefreshOptions = {}): Promise<RequestResult> {
-  const json = await requestAttempt(category, "json", 1, options);
+async function requestArticles(category: GdeltNewsCategory, options: GdeltRefreshOptions, entry: InFlightEntry): Promise<RequestResult> {
+  const json = await requestAttempt(category, "json", 1, options, entry);
   // Only a 200 response that cannot be parsed as JSON may use one same-endpoint RSS fallback.
-  return json.articles || !json.allowRssFallback ? json : requestAttempt(category, "rss", 1, options);
+  return json.articles || !json.allowRssFallback ? json : requestAttempt(category, "rss", 1, options, entry);
 }
 
 function finalOutcomeFor(result: RequestResult): GdeltRefreshFinalOutcome {
   if (result.articles) return "refresh_succeeded";
-  if (result.outcome === "http_429" || result.outcome === "rate_limited_content") return "refresh_rate_limited";
-  if (result.outcome === "timeout") return "refresh_timeout";
+  // Only a real HTTP 429 from this category may be labeled rate-limited.
+  if (result.outcome === "http_429" && result.httpStatus === 429) return "refresh_rate_limited";
+  if (result.outcome === "rate_limited_content") return "refresh_cooldown";
+  if (result.outcome === "timeout") return "refresh_cooldown";
   if (result.outcome === "http_200_non_json") return "refresh_parse_error";
   if (result.outcome === "articles_empty" || result.outcome === "articles_filtered_empty") return "refresh_empty";
   return "refresh_network_error";
@@ -379,59 +444,134 @@ function finalOutcomeFor(result: RequestResult): GdeltRefreshFinalOutcome {
 
 function fallbackAfterFailure(key: string, result: RequestResult): GdeltResult<GdeltArticle[]> {
   const cached = cache.get(key);
-  if (cached) {
-    const status: GdeltCacheStatus = result.outcome === "http_429" || result.outcome === "rate_limited_content" ? "stale_cooldown" : "stale";
-    return cachedResult(cached, status, result.outcome);
-  }
-  const status: GdeltCacheStatus = result.outcome === "http_429" || result.outcome === "rate_limited_content" ? "unavailable_cooldown" : "unavailable_refreshing";
-  return unavailableResult(result.sourceFormat, status, result.outcome);
+  const isRateLimited = result.outcome === "http_429" || result.outcome === "rate_limited_content";
+  if (cached) return cachedResult(cached, isRateLimited ? "stale_cooldown" : "stale", result.outcome);
+  return unavailableResult(result.sourceFormat, isRateLimited ? "unavailable_cooldown" : "unavailable_refreshing", result.outcome);
+}
+
+function requestDeadlineAt(options: GdeltRefreshOptions): number {
+  const now = Date.now();
+  const providerLimit = options.awaitRefresh ? now + MANUAL_PROVIDER_TIMEOUT_MS : now + REQUEST_TIMEOUT_MS;
+  return options.deadlineAt ? Math.min(options.deadlineAt, providerLimit) : providerLimit;
+}
+
+function inFlightTiming(entry: InFlightEntry): { inFlightAgeMs: number; remainingMs: number } {
+  const now = Date.now();
+  return { inFlightAgeMs: Math.max(0, now - entry.startedAt), remainingMs: Math.max(0, entry.deadlineAt - now) };
+}
+
+function abortAndRemoveInFlight(key: string, entry: InFlightEntry, reason: "deadline" | "superseded_by_manual"): void {
+  entry.abortReason = reason;
+  if (!entry.controller.signal.aborted) entry.controller.abort();
+  if (inFlight.get(key) === entry) inFlight.delete(key);
+}
+
+function isManualJoinable(entry: InFlightEntry): boolean {
+  const { inFlightAgeMs, remainingMs } = inFlightTiming(entry);
+  return !entry.settled && !entry.controller.signal.aborted && inFlightAgeMs < MANUAL_JOIN_MAX_AGE_MS && remainingMs >= MANUAL_JOIN_MIN_REMAINING_MS;
 }
 
 function getOrStartRefresh(key: string, category: GdeltNewsCategory, options: GdeltRefreshOptions = {}): Promise<RefreshOperationResult> {
   const running = inFlight.get(key);
-  if (running) return running;
+  if (running) {
+    const { inFlightAgeMs, remainingMs } = inFlightTiming(running);
+    if (!options.awaitRefresh) return running.promise;
+    if (isManualJoinable(running)) {
+      diagnostic({ event: "manual_refresh_category_joined_in_flight", requestId: options.requestId ?? null, refreshId: options.refreshId ?? null, invocationStartedAt: options.invocationStartedAt ?? null, category, query: CATEGORY_QUERY[category], inFlightAgeMs, remainingMs, startedAt: new Date(running.startedAt).toISOString(), deadlineAt: new Date(running.deadlineAt).toISOString() });
+      return running.promise;
+    }
+    diagnostic({ event: "manual_refresh_category_replaced_in_flight", requestId: options.requestId ?? null, refreshId: options.refreshId ?? null, invocationStartedAt: options.invocationStartedAt ?? null, category, query: CATEGORY_QUERY[category], inFlightAgeMs, remainingMs, startedAt: new Date(running.startedAt).toISOString(), deadlineAt: new Date(running.deadlineAt).toISOString(), reason: running.controller.signal.aborted || running.settled ? "settled_or_aborted" : "insufficient_remaining_time" });
+    abortAndRemoveInFlight(key, running, "superseded_by_manual");
+  }
+
   const startedAt = Date.now();
+  const deadlineAt = requestDeadlineAt(options);
+  const controller = new AbortController();
+  const entry: InFlightEntry = { promise: Promise.resolve(null as never), controller, startedAt, deadlineAt, category, settled: false, abortReason: null };
+  const deadlineTimer = setTimeout(() => {
+    entry.abortReason = "deadline";
+    if (!controller.signal.aborted) controller.abort();
+  }, Math.max(1, deadlineAt - Date.now()));
   const operation = (async (): Promise<RefreshOperationResult> => {
     try {
-      const requested = await requestArticles(category, options);
+      const requested = await requestArticles(category, options, entry);
       const finalOutcome = finalOutcomeFor(requested);
+      const elapsedMs = elapsedFromProviderTimes(requested.providerStartedAt, requested.providerEndedAt);
+      const cooldownReason = requested.articles ? null : cooldownReasonFor(requested.outcome);
+      // A manual request that replaces an old/near-dead background task owns subsequent cache state.
+      // The old aborted task must not write a short failure cache over that newer attempt.
+      if (entry.abortReason === "superseded_by_manual") {
+        const result = fallbackAfterFailure(key, requested);
+        diagnostic({ event: "provider_refresh_superseded", requestId: options.requestId ?? null, refreshId: options.refreshId ?? null, category, query: CATEGORY_QUERY[category], outcome: requested.outcome, finalOutcome: "refresh_cooldown", cacheWriteSucceeded: false, elapsedMs, providerStartedAt: requested.providerStartedAt ?? null, providerEndedAt: requested.providerEndedAt ?? null, httpStatus: requested.httpStatus ?? null, rawArticleCount: requested.rawArticleCount ?? 0, filteredArticleCount: requested.filteredArticleCount ?? 0, lastFailureStatus: requested.outcome, cooldownReason, errorCategory: requested.outcome });
+        return { result, request: requested, finalOutcome: "refresh_cooldown", elapsedMs, cacheWriteSucceeded: false, cooldownReason, lastFailureStatus: requested.outcome };
+      }
       if (requested.articles) {
         cacheSuccess(key, requested.articles, requested.sourceFormat);
-        const entry = cache.get(key);
-        const result = entry ? cachedResult(entry, "fresh", null) : unavailableResult(requested.sourceFormat, "unavailable_refreshing", requested.outcome);
-        diagnostic({ event: "provider_refresh_finished", requestId: options.requestId ?? null, refreshId: options.refreshId ?? null, invocationStartedAt: options.invocationStartedAt ?? null, category, query: CATEGORY_QUERY[category], sourceFormat: requested.sourceFormat, requestUrl: buildUrl(category, requested.sourceFormat).toString(), outcome: requested.outcome, finalOutcome, cache: "refresh_success", cacheWriteSucceeded: true, elapsedMs: Date.now() - startedAt, providerStartedAt: requested.providerStartedAt ?? null, providerEndedAt: requested.providerEndedAt ?? null, httpStatus: requested.httpStatus ?? null, rawArticleCount: requested.rawArticleCount ?? 0, filteredArticleCount: requested.filteredArticleCount ?? 0, errorCategory: null });
-        return { result, request: requested, finalOutcome, elapsedMs: Date.now() - startedAt, cacheWriteSucceeded: true };
+        const cached = cache.get(key);
+        const result = cached ? cachedResult(cached, "fresh", null) : unavailableResult(requested.sourceFormat, "unavailable_refreshing", requested.outcome);
+        diagnostic({ event: "provider_refresh_finished", requestId: options.requestId ?? null, refreshId: options.refreshId ?? null, invocationStartedAt: options.invocationStartedAt ?? null, category, query: CATEGORY_QUERY[category], sourceFormat: requested.sourceFormat, requestUrl: buildUrl(category, requested.sourceFormat).toString(), outcome: requested.outcome, finalOutcome, cache: "refresh_success", cacheWriteSucceeded: true, elapsedMs, providerStartedAt: requested.providerStartedAt ?? null, providerEndedAt: requested.providerEndedAt ?? null, httpStatus: requested.httpStatus ?? null, rawArticleCount: requested.rawArticleCount ?? 0, filteredArticleCount: requested.filteredArticleCount ?? 0, lastFailureStatus: null, cooldownReason: null, errorCategory: null });
+        return { result, request: requested, finalOutcome, elapsedMs, cacheWriteSucceeded: true, cooldownReason: null, lastFailureStatus: null };
       }
       const cooldownUntil = requested.cooldownMs ? Date.now() + requested.cooldownMs : Date.now() + EMPTY_OR_FAILURE_TTL_MS;
-      failureCache.set(key, { until: Math.max(cooldownUntil, providerCooldownUntil), outcome: requested.outcome });
+      failureCache.set(key, { until: Math.max(cooldownUntil, providerCooldownUntil), outcome: requested.outcome, cooldownReason });
       const result = fallbackAfterFailure(key, requested);
-      diagnostic({ event: "provider_refresh_finished", requestId: options.requestId ?? null, refreshId: options.refreshId ?? null, invocationStartedAt: options.invocationStartedAt ?? null, category, query: CATEGORY_QUERY[category], sourceFormat: requested.sourceFormat, requestUrl: buildUrl(category, requested.sourceFormat).toString(), outcome: requested.outcome, finalOutcome, cache: "refresh_failed_kept_last_known_good", cacheWriteSucceeded: false, elapsedMs: Date.now() - startedAt, providerStartedAt: requested.providerStartedAt ?? null, providerEndedAt: requested.providerEndedAt ?? null, cooldownUntil: Math.max(cooldownUntil, providerCooldownUntil), httpStatus: requested.httpStatus ?? null, rawArticleCount: requested.rawArticleCount ?? 0, filteredArticleCount: requested.filteredArticleCount ?? 0, errorCategory: requested.outcome });
-      return { result, request: requested, finalOutcome, elapsedMs: Date.now() - startedAt, cacheWriteSucceeded: false };
+      diagnostic({ event: "provider_refresh_finished", requestId: options.requestId ?? null, refreshId: options.refreshId ?? null, invocationStartedAt: options.invocationStartedAt ?? null, category, query: CATEGORY_QUERY[category], sourceFormat: requested.sourceFormat, requestUrl: buildUrl(category, requested.sourceFormat).toString(), outcome: requested.outcome, finalOutcome, cache: "refresh_failed_kept_last_known_good", cacheWriteSucceeded: false, elapsedMs, providerStartedAt: requested.providerStartedAt ?? null, providerEndedAt: requested.providerEndedAt ?? null, cooldownUntil: Math.max(cooldownUntil, providerCooldownUntil), httpStatus: requested.httpStatus ?? null, rawArticleCount: requested.rawArticleCount ?? 0, filteredArticleCount: requested.filteredArticleCount ?? 0, lastFailureStatus: requested.outcome, cooldownReason, errorCategory: requested.outcome });
+      return { result, request: requested, finalOutcome, elapsedMs, cacheWriteSucceeded: false, cooldownReason, lastFailureStatus: requested.outcome };
     } catch (error) {
       const outcome: GdeltOutcome = "network_error";
-      failureCache.set(key, { until: Date.now() + EMPTY_OR_FAILURE_TTL_MS, outcome });
-      const result = fallbackAfterFailure(key, { articles: null, retryOnTimeout: false, allowRssFallback: false, sourceFormat: "json", outcome, cooldownMs: null });
-      diagnostic({ event: "provider_refresh_finished", requestId: options.requestId ?? null, refreshId: options.refreshId ?? null, invocationStartedAt: options.invocationStartedAt ?? null, category, query: CATEGORY_QUERY[category], sourceFormat: "json", requestUrl: buildUrl(category, "json").toString(), outcome, finalOutcome: "refresh_network_error", cache: "refresh_exception_kept_last_known_good", cacheWriteSucceeded: false, elapsedMs: Date.now() - startedAt, providerStartedAt: null, providerEndedAt: new Date().toISOString(), httpStatus: null, rawArticleCount: 0, filteredArticleCount: 0, errorCategory: error instanceof Error ? error.name : outcome });
-      const request: RequestResult = { articles: null, retryOnTimeout: false, allowRssFallback: false, sourceFormat: "json", outcome, cooldownMs: null, httpStatus: null, rawArticleCount: 0, filteredArticleCount: 0, providerStartedAt: null, providerEndedAt: new Date().toISOString() };
-      return { result, request, finalOutcome: "refresh_network_error", elapsedMs: Date.now() - startedAt, cacheWriteSucceeded: false };
+      const providerEndedAt = new Date().toISOString();
+      const request: RequestResult = { articles: null, retryOnTimeout: false, allowRssFallback: false, sourceFormat: "json", outcome, cooldownMs: null, httpStatus: null, rawArticleCount: 0, filteredArticleCount: 0, providerStartedAt: null, providerEndedAt };
+      failureCache.set(key, { until: Date.now() + EMPTY_OR_FAILURE_TTL_MS, outcome, cooldownReason: "network_error" });
+      const result = fallbackAfterFailure(key, request);
+      diagnostic({ event: "provider_refresh_finished", requestId: options.requestId ?? null, refreshId: options.refreshId ?? null, invocationStartedAt: options.invocationStartedAt ?? null, category, query: CATEGORY_QUERY[category], sourceFormat: "json", requestUrl: buildUrl(category, "json").toString(), outcome, finalOutcome: "refresh_network_error", cache: "refresh_exception_kept_last_known_good", cacheWriteSucceeded: false, elapsedMs: 0, providerStartedAt: null, providerEndedAt, httpStatus: null, rawArticleCount: 0, filteredArticleCount: 0, lastFailureStatus: outcome, cooldownReason: "network_error", ...networkDiagnostics(error), errorCategory: outcome });
+      return { result, request, finalOutcome: "refresh_network_error", elapsedMs: 0, cacheWriteSucceeded: false, cooldownReason: "network_error", lastFailureStatus: outcome };
     } finally {
-      inFlight.delete(key);
+      clearTimeout(deadlineTimer);
+      entry.settled = true;
+      if (inFlight.get(key) === entry) inFlight.delete(key);
     }
   })();
-  inFlight.set(key, operation);
+  entry.promise = operation;
+  inFlight.set(key, entry);
   return operation;
 }
 
 function startBackgroundRefresh(key: string, category: GdeltNewsCategory): void {
   if (inFlight.has(key) || Date.now() < providerCooldownUntil) return;
   const operation = getOrStartRefresh(key, category);
-  // Vercel keeps this normal-page SWR work alive after the HTTP response without blocking it.
+  // Vercel keeps normal-page SWR work alive after the response without blocking the page.
   waitUntil(operation);
+}
+
+function logManualCategoryFinished(category: GdeltNewsCategory, options: GdeltRefreshOptions, completed: RefreshOperationResult, entryTiming: { inFlightAgeMs: number; remainingMs: number }): void {
+  diagnostic({
+    event: "manual_refresh_category_finished",
+    requestId: options.requestId ?? null,
+    refreshId: options.refreshId ?? null,
+    invocationStartedAt: options.invocationStartedAt ?? null,
+    category,
+    query: CATEGORY_QUERY[category],
+    finalOutcome: completed.finalOutcome,
+    outcome: completed.request.outcome,
+    elapsedMs: completed.elapsedMs,
+    cache: completed.result.cacheStatus,
+    cacheWriteSucceeded: completed.cacheWriteSucceeded,
+    providerStartedAt: completed.request.providerStartedAt ?? null,
+    providerEndedAt: completed.request.providerEndedAt ?? null,
+    httpStatus: completed.request.httpStatus ?? null,
+    rawArticleCount: completed.request.rawArticleCount ?? 0,
+    filteredArticleCount: completed.request.filteredArticleCount ?? 0,
+    lastFailureStatus: completed.lastFailureStatus,
+    cooldownReason: completed.cooldownReason,
+    inFlightAgeMs: entryTiming.inFlightAgeMs,
+    remainingMs: entryTiming.remainingMs,
+    errorCategory: completed.result.errorCategory
+  });
 }
 
 /**
  * Normal page loads return fresh or last-known-good content immediately and schedule a
- * Vercel-managed SWR operation. Manual calls with awaitRefresh instead wait for the true fetch.
+ * Vercel-managed SWR operation. Manual calls await a real, deadline-bounded provider request.
  */
 export async function getGdeltRecentArticles(category: GdeltNewsCategory, options: GdeltRefreshOptions = {}): Promise<GdeltResult<GdeltArticle[]> | null> {
   const key = `gdelt:doc:${category}:${CATEGORY_QUERY[category]}`;
@@ -439,20 +579,39 @@ export async function getGdeltRecentArticles(category: GdeltNewsCategory, option
   const reusableEntry = stale ?? (options.forceRefresh ? cache.get(key) ?? null : null);
   const failure = failureCache.get(key);
   const now = Date.now();
-  const inCooldown = now < providerCooldownUntil || (failure?.until ?? 0) > now;
+  if (failure && failure.until <= now) failureCache.delete(key);
+  const activeFailure = failure && failure.until > now ? failure : null;
+  const providerRateLimited = now < providerCooldownUntil;
+  const failureRateLimited = activeFailure?.cooldownReason === "http_429" || activeFailure?.cooldownReason === "rate_limited_content";
+  const rateLimited = providerRateLimited || failureRateLimited;
+  const failureCooling = Boolean(activeFailure) && !failureRateLimited;
 
   if (options.awaitRefresh) {
-    if (inCooldown) {
-      const outcome = failure?.outcome ?? "rate_limited_content";
-      const result = reusableEntry ? cachedResult(reusableEntry, "stale_cooldown", outcome) : unavailableResult("json", "unavailable_cooldown", outcome);
-      diagnostic({ event: "provider_refresh_finished", requestId: options.requestId ?? null, refreshId: options.refreshId ?? null, invocationStartedAt: options.invocationStartedAt ?? null, category, query: CATEGORY_QUERY[category], sourceFormat: result.sourceFormat, requestUrl: buildUrl(category, result.sourceFormat).toString(), outcome, finalOutcome: "refresh_rate_limited", cache: result.cacheStatus, cacheWriteSucceeded: false, elapsedMs: 0, providerStartedAt: null, providerEndedAt: new Date().toISOString(), cooldownUntil: providerCooldownUntil || failure?.until || null, httpStatus: null, rawArticleCount: 0, filteredArticleCount: 0, errorCategory: outcome });
-      diagnostic({ event: "manual_refresh_category_finished", requestId: options.requestId ?? null, refreshId: options.refreshId ?? null, invocationStartedAt: options.invocationStartedAt ?? null, category, query: CATEGORY_QUERY[category], finalOutcome: "refresh_rate_limited", outcome, elapsedMs: 0, cache: result.cacheStatus, cacheWriteSucceeded: false, providerStartedAt: null, providerEndedAt: new Date().toISOString(), httpStatus: null, rawArticleCount: 0, filteredArticleCount: 0, errorCategory: outcome });
+    if (rateLimited || failureCooling) {
+      const outcome = providerRateLimited ? (providerCooldownReason === "http_429" ? "http_429" : "rate_limited_content") : activeFailure?.outcome ?? "network_error";
+      const cooldownReason = providerRateLimited ? providerCooldownReason : activeFailure?.cooldownReason ?? "network_error";
+      // This category is being blocked locally and has no new HTTP 429 response of its own.
+      const finalOutcome: GdeltRefreshFinalOutcome = "refresh_cooldown";
+      const result = reusableEntry ? cachedResult(reusableEntry, rateLimited ? "stale_cooldown" : "stale", outcome) : unavailableResult("json", rateLimited ? "unavailable_cooldown" : "unavailable_refreshing", outcome);
+      const providerEndedAt = new Date().toISOString();
+      const completed: RefreshOperationResult = {
+        result,
+        request: { articles: null, retryOnTimeout: false, allowRssFallback: false, sourceFormat: result.sourceFormat, outcome, cooldownMs: Math.max(0, (providerRateLimited ? providerCooldownUntil : activeFailure?.until ?? now) - now), httpStatus: null, rawArticleCount: 0, filteredArticleCount: 0, providerStartedAt: null, providerEndedAt },
+        finalOutcome,
+        elapsedMs: 0,
+        cacheWriteSucceeded: false,
+        cooldownReason: cooldownReason ?? "network_error",
+        lastFailureStatus: outcome
+      };
+      diagnostic({ event: "provider_refresh_finished", requestId: options.requestId ?? null, refreshId: options.refreshId ?? null, invocationStartedAt: options.invocationStartedAt ?? null, category, query: CATEGORY_QUERY[category], sourceFormat: result.sourceFormat, requestUrl: buildUrl(category, result.sourceFormat).toString(), outcome, finalOutcome, cache: result.cacheStatus, cacheWriteSucceeded: false, elapsedMs: 0, providerStartedAt: null, providerEndedAt, cooldownUntil: providerRateLimited ? providerCooldownUntil : activeFailure?.until ?? null, httpStatus: null, rawArticleCount: 0, filteredArticleCount: 0, lastFailureStatus: outcome, cooldownReason: cooldownReason ?? "network_error", errorCategory: outcome });
+      logManualCategoryFinished(category, options, completed, { inFlightAgeMs: 0, remainingMs: options.deadlineAt ? Math.max(0, options.deadlineAt - Date.now()) : 0 });
       return result;
     }
-    const joinedInFlight = inFlight.has(key);
-    if (joinedInFlight) diagnostic({ event: "manual_refresh_category_joined_in_flight", requestId: options.requestId ?? null, refreshId: options.refreshId ?? null, invocationStartedAt: options.invocationStartedAt ?? null, category, query: CATEGORY_QUERY[category] });
+
+    const running = inFlight.get(key);
+    const initialTiming = running ? inFlightTiming(running) : { inFlightAgeMs: 0, remainingMs: options.deadlineAt ? Math.max(0, options.deadlineAt - Date.now()) : MANUAL_PROVIDER_TIMEOUT_MS };
     const completed = await getOrStartRefresh(key, category, options);
-    diagnostic({ event: "manual_refresh_category_finished", requestId: options.requestId ?? null, refreshId: options.refreshId ?? null, invocationStartedAt: options.invocationStartedAt ?? null, category, query: CATEGORY_QUERY[category], finalOutcome: completed.finalOutcome, outcome: completed.request.outcome, elapsedMs: completed.elapsedMs, cache: completed.result.cacheStatus, cacheWriteSucceeded: completed.cacheWriteSucceeded, providerStartedAt: completed.request.providerStartedAt ?? null, providerEndedAt: completed.request.providerEndedAt ?? null, httpStatus: completed.request.httpStatus ?? null, rawArticleCount: completed.request.rawArticleCount ?? 0, filteredArticleCount: completed.request.filteredArticleCount ?? 0, errorCategory: completed.result.errorCategory });
+    logManualCategoryFinished(category, options, completed, initialTiming);
     return completed.result;
   }
 
@@ -461,16 +620,16 @@ export async function getGdeltRecentArticles(category: GdeltNewsCategory, option
     return fresh;
   }
   if (reusableEntry) {
-    const error = failure?.outcome ?? null;
-    const status: GdeltCacheStatus = inCooldown ? "stale_cooldown" : "stale_refreshing";
-    if (!inCooldown) startBackgroundRefresh(key, category);
-    diagnostic({ category, query: CATEGORY_QUERY[category], sourceFormat: reusableEntry.sourceFormat, requestUrl: buildUrl(category, reusableEntry.sourceFormat).toString(), attempt: 0, outcome: error ?? "success", cache: status, forcedRefresh: Boolean(options.forceRefresh), timeoutMs: REQUEST_TIMEOUT_MS, staleUntil: reusableEntry.staleUntil, cooldownUntil: providerCooldownUntil || null, httpStatus: null, contentType: null, responseTextLength: 0, topLevelFields: [], articlesIsArray: reusableEntry.sourceFormat === "json", rawArticleCount: reusableEntry.value.length, filteredArticleCount: reusableEntry.value.length, errorCategory: error });
+    const error = activeFailure?.outcome ?? null;
+    const status: GdeltCacheStatus = rateLimited ? "stale_cooldown" : failureCooling ? "stale" : "stale_refreshing";
+    if (!rateLimited && !failureCooling) startBackgroundRefresh(key, category);
+    diagnostic({ category, query: CATEGORY_QUERY[category], sourceFormat: reusableEntry.sourceFormat, requestUrl: buildUrl(category, reusableEntry.sourceFormat).toString(), attempt: 0, outcome: error ?? "success", cache: status, forcedRefresh: Boolean(options.forceRefresh), timeoutMs: REQUEST_TIMEOUT_MS, staleUntil: reusableEntry.staleUntil, cooldownUntil: providerRateLimited ? providerCooldownUntil : activeFailure?.until ?? null, cooldownReason: providerRateLimited ? providerCooldownReason : activeFailure?.cooldownReason ?? null, httpStatus: null, contentType: null, responseTextLength: 0, topLevelFields: [], articlesIsArray: reusableEntry.sourceFormat === "json", rawArticleCount: reusableEntry.value.length, filteredArticleCount: reusableEntry.value.length, lastFailureStatus: activeFailure?.outcome ?? null, errorCategory: error });
     return cachedResult(reusableEntry, status, error);
   }
 
-  const outcome = failure?.outcome ?? (inCooldown ? "rate_limited_content" : "network_error");
-  const status: GdeltCacheStatus = inCooldown ? "unavailable_cooldown" : "unavailable_refreshing";
-  if (!inCooldown) startBackgroundRefresh(key, category);
-  diagnostic({ category, query: CATEGORY_QUERY[category], sourceFormat: "json", requestUrl: buildUrl(category, "json").toString(), attempt: 0, outcome, cache: status, timeoutMs: REQUEST_TIMEOUT_MS, cooldownUntil: providerCooldownUntil || null, httpStatus: null, contentType: null, responseTextLength: 0, topLevelFields: [], articlesIsArray: false, rawArticleCount: 0, filteredArticleCount: 0, errorCategory: outcome });
+  const outcome = activeFailure?.outcome ?? (rateLimited ? (providerCooldownReason === "http_429" ? "http_429" : "rate_limited_content") : "network_error");
+  const status: GdeltCacheStatus = rateLimited ? "unavailable_cooldown" : "unavailable_refreshing";
+  if (!rateLimited && !failureCooling) startBackgroundRefresh(key, category);
+  diagnostic({ category, query: CATEGORY_QUERY[category], sourceFormat: "json", requestUrl: buildUrl(category, "json").toString(), attempt: 0, outcome, cache: status, timeoutMs: REQUEST_TIMEOUT_MS, cooldownUntil: providerRateLimited ? providerCooldownUntil : activeFailure?.until ?? null, cooldownReason: providerRateLimited ? providerCooldownReason : activeFailure?.cooldownReason ?? null, httpStatus: null, contentType: null, responseTextLength: 0, topLevelFields: [], articlesIsArray: false, rawArticleCount: 0, filteredArticleCount: 0, lastFailureStatus: activeFailure?.outcome ?? null, errorCategory: outcome });
   return unavailableResult("json", status, outcome);
 }

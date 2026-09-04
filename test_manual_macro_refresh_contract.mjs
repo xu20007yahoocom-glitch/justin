@@ -34,7 +34,12 @@ const assertions = {
   mining_force_refresh_preserves_lkg: mining.includes("export interface MineralRssRefreshOptions") && mining.includes("const fallback = stale ?? (fresh && options.forceRefresh ? { ...fresh, isStale: true } : null)"),
   gdelt_manual_fetch_is_not_fire_and_forget: gdelt.includes('cache: "no-store"') && gdelt.includes('event: "provider_request_started"') && gdelt.includes('event: "provider_response_received"') && gdelt.includes('event: "provider_request_failed"') && !gdelt.includes('"refresh_started"'),
   gdelt_manual_categories_bypass_serial_queue: gdelt.includes("reserveRequestSlot(Boolean(options.awaitRefresh))") && gdelt.includes("if (parallelManualRefresh) return 0"),
-  gdelt_final_diagnostic_has_counts_and_cache_write: gdelt.includes('event: "manual_refresh_category_finished"') && gdelt.includes("cacheWriteSucceeded") && gdelt.includes("rawArticleCount") && gdelt.includes("filteredArticleCount") && gdelt.includes("providerStartedAt") && gdelt.includes("providerEndedAt"),
+  gdelt_manual_provider_timeout_is_six_seconds: gdelt.includes("const MANUAL_PROVIDER_TIMEOUT_MS = 6_000") && gdelt.includes("Math.min(options.deadlineAt, providerLimit)"),
+  gdelt_expired_inflight_is_aborted_and_replaced: gdelt.includes("interface InFlightEntry") && gdelt.includes("controller: AbortController") && gdelt.includes("MANUAL_JOIN_MAX_AGE_MS = 3_000") && gdelt.includes("MANUAL_JOIN_MIN_REMAINING_MS = 3_000") && gdelt.includes("abortAndRemoveInFlight") && gdelt.includes("manual_refresh_category_replaced_in_flight"),
+  gdelt_finally_clears_only_own_inflight_entry: gdelt.includes("entry.settled = true") && gdelt.includes("if (inFlight.get(key) === entry) inFlight.delete(key)"),
+  gdelt_timeout_is_cooldown_not_rate_limited: gdelt.includes('if (result.outcome === "timeout") return "refresh_cooldown"') && gdelt.includes('result.outcome === "http_429" && result.httpStatus === 429'),
+  gdelt_network_diagnostics_are_safe_and_structured: gdelt.includes("function networkDiagnostics") && gdelt.includes("causeCode") && gdelt.includes("networkPhase") && gdelt.includes("addressFamily") && gdelt.includes("safeErrorText"),
+  gdelt_final_diagnostic_has_counts_and_cache_write: gdelt.includes('event: "manual_refresh_category_finished"') && gdelt.includes("cacheWriteSucceeded") && gdelt.includes("rawArticleCount") && gdelt.includes("filteredArticleCount") && gdelt.includes("providerStartedAt") && gdelt.includes("providerEndedAt") && gdelt.includes("lastFailureStatus") && gdelt.includes("cooldownReason"),
 };
 
 for (const [name, passed] of Object.entries(assertions)) assert.equal(passed, true, name);
