@@ -23,11 +23,12 @@ const assertions = {
   backend_single_flight: macro.includes("let manualRefreshInFlight") && macro.includes("if (manualRefreshInFlight) {") && macro.includes("return manualRefreshInFlight;"),
   backend_manual_response_is_not_cached: macro.includes('res.setHeader("Cache-Control", "private, no-store")'),
   backend_merges_previous_sections: macro.includes("function mergeWithPrevious") && macro.includes("mergeItemsWithPrevious") && macro.includes("mergeNewsSectionWithPrevious"),
-  backend_forces_each_provider_cache_path: macro.includes('getFredLatestObservation("DCOILWTICO", { forceRefresh })') && macro.includes('getEiaCountryEnergy(definition, { forceRefresh })') && macro.includes('getGdeltRecentArticles("geopolitical", { forceRefresh })') && macro.includes('getMiningComMineralNews({ forceRefresh })'),
+  backend_forces_each_provider_cache_path: macro.includes('getFredLatestObservation("DCOILWTICO", { forceRefresh })') && macro.includes('getEiaCountryEnergy(definition, { forceRefresh })') && macro.includes('getGdeltRecentArticles("geopolitical", { forceRefresh, awaitRefresh: Boolean(manualGdelt)') && macro.includes('getMiningComMineralNews({ forceRefresh })'),
   fred_force_refresh_preserves_lkg: fred.includes("export interface FredRefreshOptions") && fred.includes("fresh && options.forceRefresh ? { ...fresh, isStale: true }") && fred.includes("if (!fallback) cacheValue(key, null, FAILURE_TTL_MS, null)"),
   eia_force_refresh_preserves_lkg: eia.includes("export interface EiaRefreshOptions") && eia.includes("fresh && options.forceRefresh ? { ...fresh, isStale: true }") && eia.includes("if (!fallback) cacheValue(key, null, FAILURE_TTL_MS, null)"),
-  gdelt_force_refresh_respects_cooldown: gdelt.includes("export interface GdeltRefreshOptions") && gdelt.includes("if (!inCooldown) startRefresh(key, category)") && gdelt.includes("const reusableEntry = stale ?? (options.forceRefresh ? cache.get(key) ?? null : null)"),
+  gdelt_force_refresh_respects_cooldown: gdelt.includes("export interface GdeltRefreshOptions") && gdelt.includes("awaitRefresh?: boolean") && gdelt.includes("await getOrStartRefresh(key, category, options)") && gdelt.includes("waitUntil(operation)") && gdelt.includes("const reusableEntry = stale ?? (options.forceRefresh ? cache.get(key) ?? null : null)"),
   mining_force_refresh_preserves_lkg: mining.includes("export interface MineralRssRefreshOptions") && mining.includes("const fallback = stale ?? (fresh && options.forceRefresh ? { ...fresh, isStale: true } : null)"),
+  gdelt_manual_fetch_is_not_fire_and_forget: gdelt.includes('cache: "no-store"') && gdelt.includes('event: "provider_request_started"') && gdelt.includes('event: "provider_response_received"') && gdelt.includes('event: "provider_request_failed"') && !gdelt.includes('"refresh_started"'),
 };
 
 for (const [name, passed] of Object.entries(assertions)) assert.equal(passed, true, name);

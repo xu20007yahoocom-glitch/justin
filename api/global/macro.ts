@@ -36,8 +36,13 @@ interface CachedMacro {
 }
 
 let macroCache: CachedMacro | null = null;
-let manualRefreshInFlight: Promise<GlobalMacroReference> | null = null;
+interface ManualRefreshFlight {
+  refreshId: string;
+  promise: Promise<GlobalMacroReference>;
+}
+let manualRefreshInFlight: ManualRefreshFlight | null = null;
 const MANUAL_REFRESH_TIMEOUT_MS = 9_000;
+const MANUAL_GDELT_DEADLINE_MS = 8_500;
 
 function dedupeSources(sources: Array<GlobalMacroSource | null>): GlobalMacroSource[] {
   const seen = new Set<string>();
@@ -300,13 +305,14 @@ async function mapWithConcurrency<T, R>(values: readonly T[], limit: number, map
   return results;
 }
 
-async function generateMacro(forceRefresh = false): Promise<GlobalMacroReference> {
+async function generateMacro(forceRefresh = false, manualGdelt: { refreshId: string; deadlineAt: number } | null = null): Promise<GlobalMacroReference> {
   try {
-    const newsPromise = Promise.allSettled([
-      getGdeltRecentArticles("geopolitical", { forceRefresh }),
-      getGdeltRecentArticles("economic", { forceRefresh }),
-      getMiningComMineralNews({ forceRefresh })
+    // For refresh=1, both categories await their real DOC API operation. Normal loads retain SWR.
+    const gdeltPromise = Promise.allSettled([
+      getGdeltRecentArticles("geopolitical", { forceRefresh, awaitRefresh: Boolean(manualGdelt), refreshId: manualGdelt?.refreshId, deadlineAt: manualGdelt?.deadlineAt }),
+      getGdeltRecentArticles("economic", { forceRefresh, awaitRefresh: Boolean(manualGdelt), refreshId: manualGdelt?.refreshId, deadlineAt: manualGdelt?.deadlineAt })
     ]);
+    const mineralPromise = getMiningComMineralNews({ forceRefresh });
     const [wti, brent, henryHub, rateResults, energyResults] = await Promise.all([
       getFredLatestObservation("DCOILWTICO", { forceRefresh }),
       getFredLatestObservation("POILBREUSDM", { forceRefresh }),
@@ -314,10 +320,10 @@ async function generateMacro(forceRefresh = false): Promise<GlobalMacroReference
       mapWithConcurrency(FRED_MAJOR_RATE_DEFINITIONS, 2, (definition) => getFredCountryRate(definition, { forceRefresh })),
       mapWithConcurrency(EIA_MAJOR_ENERGY_COUNTRIES, 1, (definition) => getEiaCountryEnergy(definition, { forceRefresh }))
     ]);
-    const [geopoliticalSettled, economicSettled, mineralSettled] = await newsPromise;
+    const [geopoliticalSettled, economicSettled] = await gdeltPromise;
+    const mineralNews = await mineralPromise;
     const geopolitical = geopoliticalSettled.status === "fulfilled" ? geopoliticalSettled.value : null;
     const economicNews = economicSettled.status === "fulfilled" ? economicSettled.value : null;
-    const mineralNews = mineralSettled.status === "fulfilled" ? mineralSettled.value : null;
     const criticalMinerals = criticalMineralsSection(mineralNews);
     const preciousMetals = section("贵金属", [unavailableItem("黄金现货价", "FRED", "FRED：LMBA Gold Price 日度数据已移除", FRED_LMBA_REMOVAL_URL, "FRED 当前未提供本端点可验证的黄金现货 series；非实时，定期更新")], "黄金现货未取得可验证 FRED 观测值，显示暂无可靠资料");
     const energyPrices = section("能源价格", [
@@ -375,21 +381,27 @@ function refreshStatus(value: GlobalMacroReference): "updated" | "partial" | "gd
   return incomplete ? "partial" : "updated";
 }
 
-function startManualRefresh(): Promise<GlobalMacroReference> {
+function createRefreshId(): string {
+  return globalThis.crypto?.randomUUID?.() ?? `macro-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function startManualRefresh(): ManualRefreshFlight {
   if (manualRefreshInFlight) {
-    console.info("MACRO_MANUAL_REFRESH", { outcome: "joined_in_flight" });
+    console.info("MACRO_MANUAL_REFRESH", { refreshId: manualRefreshInFlight.refreshId, outcome: "joined_in_flight" });
     return manualRefreshInFlight;
   }
-  console.info("MACRO_MANUAL_REFRESH", { outcome: "started" });
-  const operation = generateMacro(true);
-  manualRefreshInFlight = operation.finally(() => { manualRefreshInFlight = null; });
+  const refreshId = createRefreshId();
+  const deadlineAt = Date.now() + MANUAL_GDELT_DEADLINE_MS;
+  console.info("MACRO_MANUAL_REFRESH", { refreshId, outcome: "started", gdeltDeadlineMs: MANUAL_GDELT_DEADLINE_MS });
+  const promise = generateMacro(true, { refreshId, deadlineAt }).finally(() => { manualRefreshInFlight = null; });
+  manualRefreshInFlight = { refreshId, promise };
   return manualRefreshInFlight;
 }
 
 function waitForManualRefresh(operation: Promise<GlobalMacroReference>): Promise<GlobalMacroReference | null> {
   return new Promise((resolve) => {
     const timer = setTimeout(() => resolve(null), MANUAL_REFRESH_TIMEOUT_MS);
-    void operation.then((value) => {
+    operation.then((value) => {
       clearTimeout(timer);
       resolve(value);
     }, () => {
@@ -409,10 +421,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse): 
   try {
     if (isRefreshRequest(req)) {
       const previous = macroCache?.value ?? null;
-      const refreshed = await waitForManualRefresh(startManualRefresh());
+      const flight = startManualRefresh();
+      const refreshed = await waitForManualRefresh(flight.promise);
       const value = refreshed ?? previous ?? unavailable("正在刷新宏观数据；当前没有可用的历史缓存");
       const status = refreshed ? refreshStatus(refreshed) : previous ? "partial" : "unavailable";
-      console.info("MACRO_MANUAL_REFRESH", { outcome: refreshed ? "completed" : "timeout_fallback", status, timeoutMs: MANUAL_REFRESH_TIMEOUT_MS, usedPreviousCache: !refreshed && Boolean(previous) });
+      console.info("MACRO_MANUAL_REFRESH", { refreshId: flight.refreshId, outcome: refreshed ? "completed" : "timeout_fallback", status, timeoutMs: MANUAL_REFRESH_TIMEOUT_MS, usedPreviousCache: !refreshed && Boolean(previous) });
       res.setHeader("X-Macro-Refresh-Status", status);
       // Each manual request carries a nonce; no-store prevents a CDN/browser from preserving it.
       res.setHeader("Cache-Control", "private, no-store");
